@@ -26,6 +26,7 @@ const EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const COMMANDS: &[(&str, &str)] = &[
     ("/model", "Switch model and reasoning level"),
     ("/effort", "Set reasoning effort level"),
+    ("/setfallback", "Configure fallback model chain"),
     ("/agent", "Switch agent fallback chain"),
     ("/compact", "Summarize and compact conversation history"),
     ("/resume", "Resume a previous session"),
@@ -36,7 +37,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/help", "Show shortcuts"),
     ("/quit", "Exit cligate"),
 ];
-const HELP_TEXT: &str = "Shortcuts\n  /model   F2 / ctrl+n   switch model and effort level\n  /effort  F3 / ctrl+t   reasoning effort\n  /agent   F4 / ctrl+g   agent fallback chain\n  /compact [focus]       compact conversation into a summary\n  /resume                resume a saved session\n  /new                   start a fresh session\n  /status  F5            provider health\n  /reset   ctrl+r        clear rate-limit cooldowns\n  /clear   ctrl+l        clear conversation\n  scroll: mouse wheel, shift+up/down, PgUp/PgDn | stop: esc or ctrl+c | quit: ctrl+c";
+const HELP_TEXT: &str = "Shortcuts\n  /model       F2 / ctrl+n   switch model and effort level\n  /effort      F3 / ctrl+t   reasoning effort\n  /setfallback [m1 m2 ...]   configure fallback model chain\n  /agent       F4 / ctrl+g   agent fallback chain\n  /compact     [focus]       compact conversation into a summary\n  /resume                    resume a saved session\n  /new                       start a fresh session\n  /status      F5            provider health\n  /reset       ctrl+r        clear rate-limit cooldowns\n  /clear       ctrl+l        clear conversation\n  scroll: mouse wheel, shift+up/down, PgUp/PgDn | stop: esc or ctrl+c | quit: ctrl+c";
 
 struct RawTermGuard {
     saved_state: Option<String>,
@@ -446,6 +447,12 @@ enum Modal {
     Agent {
         selected: usize,
     },
+    Fallback {
+        selected: usize,
+        filter: String,
+        chain: Vec<String>,
+        target_agent: String,
+    },
     Session {
         selected: usize,
     },
@@ -568,6 +575,7 @@ enum Action {
     None,
     Submit(String),
     Command(String),
+    SaveFallback { agent: String, chain: Vec<String> },
     Quit,
 }
 
@@ -1222,6 +1230,42 @@ impl TuiState {
                     &items,
                 );
             }
+            Modal::Fallback {
+                selected,
+                filter,
+                chain,
+                target_agent,
+            } => {
+                let models = self.filtered_models(filter);
+                let width = cols.saturating_sub(8).clamp(44, 80);
+                let height = rows.saturating_sub(6).clamp(8, 18);
+                let list_h = height - 2;
+                let sel = (*selected).min(models.len().saturating_sub(1));
+                let win = sel
+                    .saturating_sub(list_h / 2)
+                    .min(models.len().saturating_sub(list_h));
+                let mut items = Vec::new();
+                if models.is_empty() {
+                    items.push(("no matching models".to_string(), false));
+                }
+                for (idx, (m, prov, efforts)) in models.iter().enumerate().skip(win).take(list_h) {
+                    items.push((
+                        format!("{m:<28} {prov:<6} {}", efforts.join("/")),
+                        idx == sel,
+                    ));
+                }
+                let step = match chain.len() {
+                    0 => "Pick primary (1/3)",
+                    1 => "Pick fallback #1 (2/3, Tab=save)",
+                    _ => "Pick fallback #2 (3/3, Tab=save)",
+                };
+                let title = if filter.is_empty() {
+                    format!("Fallback [{target_agent}] {step}")
+                } else {
+                    format!("Fallback [{target_agent}] {step}  filter: {filter}")
+                };
+                draw_box(buf, rows, cols, width, height, &title, &items);
+            }
             Modal::Session { selected } => {
                 let sessions = list_saved_sessions();
                 let width = cols.saturating_sub(8).clamp(42, 82);
@@ -1417,6 +1461,85 @@ fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
                         }
                     }
                     st.modal = Modal::None;
+                }
+                _ => {}
+            }
+        }
+        Modal::Fallback {
+            selected,
+            filter,
+            mut chain,
+            target_agent,
+        } => {
+            let models = st.filtered_models(&filter);
+            let last = models.len().saturating_sub(1);
+            match key {
+                Key::Esc => st.modal = Modal::None,
+                Key::Up | Key::ScrollUp => {
+                    st.modal = Modal::Fallback {
+                        selected: selected.saturating_sub(1),
+                        filter,
+                        chain,
+                        target_agent,
+                    }
+                }
+                Key::Down | Key::ScrollDown => {
+                    st.modal = Modal::Fallback {
+                        selected: (selected + 1).min(last),
+                        filter,
+                        chain,
+                        target_agent,
+                    }
+                }
+                Key::Backspace => {
+                    let mut f = filter;
+                    f.pop();
+                    st.modal = Modal::Fallback {
+                        selected: 0,
+                        filter: f,
+                        chain,
+                        target_agent,
+                    };
+                }
+                Key::Char(c) => {
+                    let mut f = filter;
+                    f.push(c);
+                    st.modal = Modal::Fallback {
+                        selected: 0,
+                        filter: f,
+                        chain,
+                        target_agent,
+                    };
+                }
+                Key::Tab => {
+                    st.modal = Modal::None;
+                    if !chain.is_empty() {
+                        return Action::SaveFallback {
+                            agent: target_agent,
+                            chain,
+                        };
+                    }
+                }
+                Key::Enter => {
+                    if let Some((m, _, _)) = models.get(selected.min(last)) {
+                        let picked = (*m).to_string();
+                        if !chain.contains(&picked) {
+                            chain.push(picked);
+                        }
+                    }
+                    if chain.len() >= 3 {
+                        st.modal = Modal::None;
+                        return Action::SaveFallback {
+                            agent: target_agent,
+                            chain,
+                        };
+                    }
+                    st.modal = Modal::Fallback {
+                        selected: 0,
+                        filter: String::new(),
+                        chain,
+                        target_agent,
+                    };
                 }
                 _ => {}
             }
@@ -1930,6 +2053,46 @@ fn run_command(
                 }
             }
         }
+        "/setfallback" | "/setfalback" | "/fallback" => {
+            if parts.len() == 1 {
+                let target_agent = st.agent.clone().unwrap_or_else(|| "default".to_string());
+                st.modal = Modal::Fallback {
+                    selected: 0,
+                    filter: String::new(),
+                    chain: Vec::new(),
+                    target_agent,
+                };
+            } else {
+                let known_agents: Vec<String> =
+                    st.agent_entries().into_iter().map(|(n, _, _)| n).collect();
+                let (target_agent, start_idx) =
+                    if parts.len() >= 3 && known_agents.iter().any(|a| a == parts[1]) {
+                        (parts[1].to_lowercase(), 2)
+                    } else {
+                        (st.agent.clone().unwrap_or_else(|| "default".to_string()), 1)
+                    };
+                let mut models = Vec::new();
+                let mut eff_ov: Option<&str> = None;
+                let mut i = start_idx;
+                while i < parts.len() {
+                    let is_flag = matches!(parts[i], "--effort" | "--reasoning" | "-e");
+                    if is_flag && i + 1 < parts.len() {
+                        eff_ov = Some(parts[i + 1]);
+                        i += 2;
+                    } else {
+                        models.push(parts[i].to_string());
+                        i += 1;
+                    }
+                }
+                if models.is_empty() {
+                    st.notice =
+                        "Usage: /setfallback [agent] <model1> <model2> [model3] [--effort <level>]"
+                            .to_string();
+                } else {
+                    apply_fallback_chain(&mut st, router, cfg, &target_agent, &models, eff_ov);
+                }
+            }
+        }
         "/agent" | "/a" => agent_command(&mut st, router, &parts),
         "/reset" => {
             let prov = parts.get(1).copied();
@@ -1952,6 +2115,45 @@ fn run_command(
     }
     st.render();
     false
+}
+
+fn apply_fallback_chain(
+    st: &mut TuiState,
+    router: &Arc<ProviderRouter>,
+    cfg: &Config,
+    agent_name: &str,
+    models: &[String],
+    eff_ov: Option<&str>,
+) {
+    let eff_val = eff_ov.unwrap_or(&st.effort).to_lowercase();
+    match router.set_agent_chain(agent_name, models, Some(&eff_val)) {
+        Ok(_) => {
+            let chain_json: Vec<Json> = models.iter().cloned().map(Json::Str).collect();
+            let body = Json::obj(vec![
+                ("agent", Json::Str(agent_name.to_string())),
+                ("chain", Json::Arr(chain_json)),
+                ("effort", Json::Str(eff_val.clone())),
+            ]);
+            let _ = http_call(
+                &cfg.host,
+                cfg.port,
+                "POST",
+                "/v1/router/agents",
+                Some(&body),
+            );
+            st.agent = Some(agent_name.to_string());
+            if let Some(first) = models.first() {
+                st.model = first.clone();
+            }
+            st.effort = eff_val.clone();
+            save_prefs(&st.model, &st.effort);
+            st.note(format!(
+                "Fallback chain saved [{agent_name}] (effort {eff_val}): {}",
+                models.join(" -> ")
+            ));
+        }
+        Err(e) => st.notice = format!("Could not save fallback chain: {e}"),
+    }
 }
 
 fn agent_command(st: &mut TuiState, router: &Arc<ProviderRouter>, parts: &[&str]) {
@@ -2084,6 +2286,11 @@ pub fn run_tui(
             Action::None => {}
             Action::Quit => break,
             Action::Submit(text) => start_turn(&state, &router, text),
+            Action::SaveFallback { agent, chain } => {
+                let mut st = state.lock().unwrap();
+                apply_fallback_chain(&mut st, &router, &cfg, &agent, &chain, None);
+                st.render();
+            }
             Action::Command(line) => {
                 if run_command(&state, &router, &cfg, &line) {
                     break;
