@@ -81,21 +81,43 @@ impl Drop for RawTermGuard {
     }
 }
 
+fn parse_stty_size(out: &std::process::Output) -> Option<(usize, usize)> {
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    let mut parts = s.split_whitespace();
+    let r = parts.next()?.parse::<usize>().ok()?;
+    let c = parts.next()?.parse::<usize>().ok()?;
+    if r >= 10 && c >= 30 {
+        Some((r, c))
+    } else {
+        None
+    }
+}
+
 fn detect_term_size() -> (usize, usize) {
-    if let Ok(out) = Command::new("stty")
-        .arg("size")
-        .stdin(Stdio::inherit())
-        .output()
-    {
-        if out.status.success() {
-            let s = String::from_utf8_lossy(&out.stdout);
-            let mut parts = s.split_whitespace();
-            if let (Some(r), Some(c)) = (parts.next(), parts.next()) {
-                if let (Ok(rows), Ok(cols)) = (r.parse::<usize>(), c.parse::<usize>()) {
-                    if rows >= 12 && cols >= 40 {
-                        return (rows, cols);
-                    }
-                }
+    let probes: &[&[&str]] = &[
+        &["-F", "/dev/tty", "size"],
+        &["-f", "/dev/tty", "size"],
+        &["size"],
+    ];
+    for args in probes {
+        if let Ok(out) = Command::new("stty")
+            .args(*args)
+            .stdin(Stdio::inherit())
+            .stderr(Stdio::null())
+            .output()
+        {
+            if let Some(sz) = parse_stty_size(&out) {
+                return sz;
+            }
+        }
+    }
+    if let (Ok(r), Ok(c)) = (std::env::var("LINES"), std::env::var("COLUMNS")) {
+        if let (Ok(rows), Ok(cols)) = (r.parse::<usize>(), c.parse::<usize>()) {
+            if rows >= 10 && cols >= 30 {
+                return (rows, cols);
             }
         }
     }
@@ -693,9 +715,10 @@ impl TuiState {
     }
 
     fn status_line(&self, cols: usize) -> String {
+        let max_w = cols.saturating_sub(1);
         let (prov, bare) = infer_provider_and_model(&self.model);
         let agent = self.agent.as_deref().unwrap_or("no agent");
-        let mut right_plain = format!("{prov}/{bare} · {} · {agent}   ", self.effort);
+        let mut right_plain = format!("{prov}/{bare} · {} · {agent}  ", self.effort);
         let mut right_styled = format!("{GRAY}{right_plain}{RESET}");
         for (name, state) in &self.badges {
             let (mark, color) = match state {
@@ -705,6 +728,10 @@ impl TuiState {
             right_plain.push_str(&format!("{name} {mark} "));
             right_styled.push_str(&format!("{GRAY}{name}{RESET} {color}{mark}{RESET} "));
         }
+        let right_len = right_plain.chars().count();
+        if right_len + 2 >= max_w {
+            return format!("{GRAY}{}{RESET}", clip(&right_plain, max_w));
+        }
         let left_text = if !self.notice.is_empty() {
             self.notice.clone()
         } else if self.scroll > 0 {
@@ -712,10 +739,9 @@ impl TuiState {
         } else {
             "/help for shortcuts, ctrl+c to quit".to_string()
         };
-        let right_len = right_plain.chars().count();
-        let left_room = cols.saturating_sub(right_len + 3);
+        let left_room = max_w.saturating_sub(right_len + 2);
         let left = clip(&left_text, left_room);
-        let gap = cols.saturating_sub(left.chars().count() + right_len + 2);
+        let gap = max_w.saturating_sub(left.chars().count() + right_len + 1);
         format!("{DIM} {left}{RESET}{}{right_styled}", " ".repeat(gap))
     }
 
@@ -751,34 +777,33 @@ impl TuiState {
         ));
 
         let border = if self.busy { DIM } else { GRAY };
-        let avail = cols.saturating_sub(6).max(1);
+        let input_row = chat_h + 3;
+        let box_w = cols.saturating_sub(1).max(10);
+        let avail = box_w.saturating_sub(6).max(1);
         let offset = if self.cursor >= avail {
             self.cursor + 1 - avail
         } else {
             0
         };
         let shown: String = self.input.iter().skip(offset).take(avail).collect();
-        let shown_len = shown.chars().count();
         let field = if self.input.is_empty() {
             let hint = clip("Try \"/model\" to switch models", avail);
-            let pad = " ".repeat(avail - hint.chars().count() + 1);
-            format!("{DIM}{hint}{RESET}{pad}")
+            format!("{DIM}{hint}{RESET}")
         } else {
-            format!("{shown}{}", " ".repeat(avail - shown_len + 1))
+            shown
         };
         buf.push_str(&format!(
             "\x1b[{};1H{border}╭{}╮{RESET}\x1b[K",
             chat_h + 2,
-            "─".repeat(cols.saturating_sub(2))
+            "─".repeat(box_w.saturating_sub(2))
         ));
         buf.push_str(&format!(
-            "\x1b[{};1H{border}│{RESET} {ACCENT}>{RESET} {field}{border}│{RESET}\x1b[K",
-            chat_h + 3
+            "\x1b[{input_row};1H{border}│{RESET} {ACCENT}>{RESET} {field}\x1b[K\x1b[{input_row};{box_w}H{border}│{RESET}",
         ));
         buf.push_str(&format!(
             "\x1b[{};1H{border}╰{}╯{RESET}\x1b[K",
             chat_h + 4,
-            "─".repeat(cols.saturating_sub(2))
+            "─".repeat(box_w.saturating_sub(2))
         ));
 
         let sel = self.sugg_sel.min(suggestions.len().saturating_sub(1));
@@ -799,8 +824,8 @@ impl TuiState {
         self.draw_modal(&mut buf, &modal, rows, cols);
 
         if modal == Modal::None {
-            let col = 5 + (self.cursor - offset);
-            buf.push_str(&format!("\x1b[{};{}H\x1b[?25h", chat_h + 3, col));
+            let col = (5 + self.cursor.saturating_sub(offset)).min(box_w.saturating_sub(2));
+            buf.push_str(&format!("\x1b[{input_row};{col}H\x1b[?25h"));
         }
         buf.push_str("\x1b[?2026l");
         let mut out = io::stdout();
