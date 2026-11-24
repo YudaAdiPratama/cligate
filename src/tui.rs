@@ -802,6 +802,7 @@ struct TuiState {
     size: (usize, usize),
     size_at: Instant,
     force_clear: bool,
+    standalone_resume: bool,
 }
 
 impl TuiState {
@@ -845,6 +846,7 @@ impl TuiState {
             size: detect_term_size(),
             size_at: Instant::now(),
             force_clear: true,
+            standalone_resume: false,
         }
     }
 
@@ -1114,7 +1116,9 @@ impl TuiState {
     }
 
     fn splash_animating(&self) -> bool {
-        self.entries.is_empty() && self.opened_at.elapsed() < Duration::from_millis(SPLASH_MS)
+        !self.standalone_resume
+            && self.entries.is_empty()
+            && self.opened_at.elapsed() < Duration::from_millis(SPLASH_MS)
     }
 
     fn logo_lines(&self) -> Vec<String> {
@@ -1406,6 +1410,17 @@ impl TuiState {
 
     fn render(&mut self) {
         let (rows, cols) = self.size;
+        if self.standalone_resume {
+            let mut buf = String::with_capacity(rows * cols);
+            buf.push_str("\x1b[?2026h\x1b[?25l\x1b[2J");
+            let modal = self.modal.clone();
+            self.draw_modal(&mut buf, &modal, rows, cols);
+            buf.push_str("\x1b[?2026l");
+            let mut out = io::stdout();
+            let _ = out.write_all(buf.as_bytes());
+            let _ = out.flush();
+            return;
+        }
         let suggestions = self.suggestions();
         let sugg_rows = suggestions.len().min(8);
         let bottom = 1 + 3 + sugg_rows + 1;
@@ -1804,6 +1819,22 @@ fn draw_box(
     ));
 }
 
+fn wrap_prev(sel: usize, last: usize) -> usize {
+    if sel == 0 || sel > last {
+        last
+    } else {
+        sel - 1
+    }
+}
+
+fn wrap_next(sel: usize, last: usize) -> usize {
+    if sel >= last {
+        0
+    } else {
+        sel + 1
+    }
+}
+
 fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
     if key == Key::CtrlC {
         if matches!(st.modal, Modal::PermissionPrompt { .. }) {
@@ -1822,16 +1853,16 @@ fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
             let models = st.filtered_models(&filter);
             let last = models.len().saturating_sub(1);
             match key {
-                Key::Esc | Key::F2 => st.modal = Modal::None,
+                Key::Esc | Key::F2 | Key::Right => st.modal = Modal::None,
                 Key::Up | Key::ScrollUp => {
                     st.modal = Modal::Model {
-                        selected: selected.saturating_sub(1),
+                        selected: wrap_prev(selected, last),
                         filter,
                     }
                 }
                 Key::Down | Key::ScrollDown => {
                     st.modal = Modal::Model {
-                        selected: (selected + 1).min(last),
+                        selected: wrap_next(selected, last),
                         filter,
                     }
                 }
@@ -1882,16 +1913,26 @@ fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
             let last = levels.len().saturating_sub(1);
             match key {
                 Key::Esc | Key::F3 => st.modal = Modal::None,
+                Key::Right => {
+                    if pending_model.is_some() {
+                        st.modal = Modal::Model {
+                            selected: 0,
+                            filter: String::new(),
+                        };
+                    } else {
+                        st.modal = Modal::None;
+                    }
+                }
                 Key::Up | Key::ScrollUp => {
                     st.modal = Modal::Effort {
-                        selected: selected.saturating_sub(1),
+                        selected: wrap_prev(selected, last),
                         levels,
                         pending_model,
                     }
                 }
                 Key::Down | Key::ScrollDown => {
                     st.modal = Modal::Effort {
-                        selected: (selected + 1).min(last),
+                        selected: wrap_next(selected, last),
                         levels,
                         pending_model,
                     }
@@ -1918,15 +1959,15 @@ fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
             let entries = st.agent_entries();
             let last = entries.len().saturating_sub(1);
             match key {
-                Key::Esc | Key::F4 => st.modal = Modal::None,
+                Key::Esc | Key::F4 | Key::Right => st.modal = Modal::None,
                 Key::Up | Key::ScrollUp => {
                     st.modal = Modal::Agent {
-                        selected: selected.saturating_sub(1),
+                        selected: wrap_prev(selected, last),
                     }
                 }
                 Key::Down | Key::ScrollDown => {
                     st.modal = Modal::Agent {
-                        selected: (selected + 1).min(last),
+                        selected: wrap_next(selected, last),
                     }
                 }
                 Key::Enter => {
@@ -1957,16 +1998,27 @@ fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
             let last = models.len().saturating_sub(1);
             match key {
                 Key::Esc => st.modal = Modal::None,
+                Key::Right => {
+                    if chain.pop().is_some() {
+                        st.modal = Modal::Fallback {
+                            selected: 0,
+                            filter: String::new(),
+                            chain,
+                        };
+                    } else {
+                        st.modal = Modal::None;
+                    }
+                }
                 Key::Up | Key::ScrollUp => {
                     st.modal = Modal::Fallback {
-                        selected: selected.saturating_sub(1),
+                        selected: wrap_prev(selected, last),
                         filter,
                         chain,
                     }
                 }
                 Key::Down | Key::ScrollDown => {
                     st.modal = Modal::Fallback {
-                        selected: (selected + 1).min(last),
+                        selected: wrap_next(selected, last),
                         filter,
                         chain,
                     }
@@ -2022,15 +2074,15 @@ fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
                 3
             };
             match key {
-                Key::Esc => st.modal = Modal::None,
+                Key::Esc | Key::Right => st.modal = Modal::None,
                 Key::Up | Key::ScrollUp => {
                     st.modal = Modal::Permissions {
-                        selected: selected.saturating_sub(1),
+                        selected: wrap_prev(selected, max_idx),
                     }
                 }
                 Key::Down | Key::ScrollDown => {
                     st.modal = Modal::Permissions {
-                        selected: (selected + 1).min(max_idx),
+                        selected: wrap_next(selected, max_idx),
                     }
                 }
                 Key::Enter => {
@@ -2075,7 +2127,7 @@ fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
         } => {
             let mut decision: Option<PermDecision> = None;
             match key {
-                Key::Esc | Key::Char('n') | Key::Char('N') | Key::Char('4') => {
+                Key::Esc | Key::Right | Key::Char('n') | Key::Char('N') | Key::Char('4') => {
                     decision = Some(PermDecision::Deny);
                 }
                 Key::Char('y') | Key::Char('Y') | Key::Char('1') => {
@@ -2085,14 +2137,14 @@ fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
                 Key::Char('3') => decision = Some(PermDecision::AlwaysAllowAll),
                 Key::Up | Key::ScrollUp => {
                     st.modal = Modal::PermissionPrompt {
-                        selected: selected.saturating_sub(1),
+                        selected: wrap_prev(selected, 3),
                         tool: tool.clone(),
                         summary,
                     };
                 }
                 Key::Down | Key::ScrollDown => {
                     st.modal = Modal::PermissionPrompt {
-                        selected: (selected + 1).min(3),
+                        selected: wrap_next(selected, 3),
                         tool: tool.clone(),
                         summary,
                     };
@@ -2130,16 +2182,16 @@ fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
         Modal::MaxWindow { selected, custom } => {
             let custom_idx = MAX_WINDOW_PRESETS.len();
             match key {
-                Key::Esc => st.modal = Modal::None,
+                Key::Esc | Key::Right => st.modal = Modal::None,
                 Key::Up | Key::ScrollUp => {
                     st.modal = Modal::MaxWindow {
-                        selected: selected.saturating_sub(1),
+                        selected: wrap_prev(selected, custom_idx),
                         custom,
                     }
                 }
                 Key::Down | Key::ScrollDown => {
                     st.modal = Modal::MaxWindow {
-                        selected: (selected + 1).min(custom_idx),
+                        selected: wrap_next(selected, custom_idx),
                         custom,
                     }
                 }
@@ -2200,25 +2252,38 @@ fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
             let sessions = list_saved_sessions();
             let last = sessions.len().saturating_sub(1);
             match key {
-                Key::Esc => st.modal = Modal::None,
+                Key::Esc | Key::Right => {
+                    if st.standalone_resume {
+                        return Action::Quit;
+                    }
+                    st.modal = Modal::None;
+                }
                 Key::Up | Key::ScrollUp => {
                     st.modal = Modal::Session {
-                        selected: selected.saturating_sub(1),
+                        selected: wrap_prev(selected, last),
                     }
                 }
                 Key::Down | Key::ScrollDown => {
                     st.modal = Modal::Session {
-                        selected: (selected + 1).min(last),
+                        selected: wrap_next(selected, last),
                     }
                 }
                 Key::Enter => {
                     if let Some(s) = sessions.get(selected.min(last)) {
                         match st.load_session(&s.id) {
-                            Ok(id) => st.note(format!("Resumed session {id}")),
+                            Ok(id) => {
+                                st.standalone_resume = false;
+                                st.force_clear = true;
+                                st.note(format!("Resumed session {id}"));
+                            }
                             Err(e) => st.notice = e,
                         }
+                        st.modal = Modal::None;
+                    } else if st.standalone_resume {
+                        return Action::Quit;
+                    } else {
+                        st.modal = Modal::None;
                     }
-                    st.modal = Modal::None;
                 }
                 _ => {}
             }
@@ -3165,6 +3230,7 @@ pub fn run_tui(
         }
         if let Some(target) = resume_target {
             if target == "picker" {
+                st.standalone_resume = true;
                 st.modal = Modal::Session { selected: 0 };
             } else {
                 match st.load_session(&target) {
@@ -3246,16 +3312,21 @@ pub fn run_tui(
 
     let summary = {
         let st = state.lock().unwrap();
-        st.save_session();
-        (st.session_id.clone(), !st.history.is_empty())
+        if st.standalone_resume {
+            None
+        } else {
+            st.save_session();
+            Some((st.session_id.clone(), !st.history.is_empty()))
+        }
     };
     drop(guard);
 
-    let (session_id, has_messages) = summary;
-    if has_messages {
-        println!("Session: {session_id}");
-        println!("Resume with: cligate --resume {session_id}");
-    } else {
-        println!("Session: {session_id} (empty, not saved)");
+    if let Some((session_id, has_messages)) = summary {
+        if has_messages {
+            println!("Session: {session_id}");
+            println!("Resume with: cligate --resume {session_id}");
+        } else {
+            println!("Session: {session_id} (empty, not saved)");
+        }
     }
 }
