@@ -937,39 +937,41 @@ impl TuiState {
                     let state_str = if r.available {
                         "ready".to_string()
                     } else {
-                        format!("limited ({})", format_dur(r.cooldown_rem))
+                        format!("limited · retry in {}", format_dur(r.cooldown_rem))
                     };
                     let tot_tok = r.input_tokens + r.output_tokens;
+                    let cache_part = if r.cached_tokens > 0 {
+                        let denom = (r.input_tokens + r.cached_tokens).max(1);
+                        let c_pct = ((r.cached_tokens * 100) / denom).min(100);
+                        format!(" · cache {c_pct}%")
+                    } else {
+                        String::new()
+                    };
+                    items.push((format!("{:<8} ({state_str})", r.name), false));
                     items.push((
                         format!(
-                            "{:<7} {} {:>3}%  {} · {} calls · {} tok",
-                            r.name,
-                            progress_bar(avail_pct, 16),
+                            "{} {:>3}%  {} calls · {} tok{cache_part}",
+                            progress_bar(avail_pct, 20),
                             avail_pct,
-                            state_str,
                             r.calls,
                             format_tokens_short(tot_tok as usize),
                         ),
                         false,
                     ));
-                    if r.cached_tokens > 0 {
-                        let denom = (r.input_tokens + r.cached_tokens).max(1);
-                        let c_pct = ((r.cached_tokens * 100) / denom).min(100) as usize;
+                    if !r.available && !r.last_error.is_empty() {
                         items.push((
-                            format!(
-                                "        cache {} {:>3}% ({} cached)",
-                                progress_bar(c_pct, 12),
-                                c_pct,
-                                format_tokens_short(r.cached_tokens as usize),
-                            ),
+                            format!("  limit: {}", clip(&r.last_error, width.saturating_sub(14))),
                             false,
                         ));
                     }
+                    items.push((String::new(), false));
                 }
-                items.push((String::new(), false));
                 items.push((
-                    "Account quota % is not exposed by CLI tools; bars show live limits & cache."
-                        .to_string(),
+                    "Server-side account quota % is not exposed by CLI tools;".to_string(),
+                    false,
+                ));
+                items.push((
+                    "bars reflect live rate-limit availability & cooldown recovery.".to_string(),
                     false,
                 ));
                 items.push(("r refresh · ← / Esc close".to_string(), false));
@@ -980,7 +982,7 @@ impl TuiState {
                     cols,
                     width,
                     height,
-                    "Provider Usage & Limits (/usage)",
+                    "Provider Quota & Limits (/usage)",
                     &items,
                 );
             }

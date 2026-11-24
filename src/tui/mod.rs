@@ -88,6 +88,7 @@ pub(super) struct ProviderUsageRow {
     pub(super) input_tokens: u64,
     pub(super) output_tokens: u64,
     pub(super) cached_tokens: u64,
+    pub(super) last_error: String,
 }
 
 #[derive(Clone, PartialEq)]
@@ -1217,10 +1218,19 @@ fn collect_usage_rows(router: &Arc<ProviderRouter>, cfg: &Config) -> Vec<Provide
                 .map(|v| v.max(0) as u64)
                 .unwrap_or(0)
         };
+        let get_str = |src: Option<&Json>, key: &str| -> String {
+            src.and_then(|o| o.get(key))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
         let l_rem = get_u64(lp, "cooldown_remaining_sec");
         let r_rem = get_u64(rp, "cooldown_remaining_sec");
         let rem = l_rem.max(r_rem);
         let tot = get_u64(lp, "cooldown_sec").max(900);
+        let l_err = get_str(lp, "last_limit_error");
+        let r_err = get_str(rp, "last_limit_error");
+        let last_error = if !l_err.is_empty() { l_err } else { r_err };
         rows.push(ProviderUsageRow {
             name: name.to_string(),
             available: rem == 0,
@@ -1230,6 +1240,7 @@ fn collect_usage_rows(router: &Arc<ProviderRouter>, cfg: &Config) -> Vec<Provide
             input_tokens: get_u64(lp, "input_tokens") + get_u64(rp, "input_tokens"),
             output_tokens: get_u64(lp, "output_tokens") + get_u64(rp, "output_tokens"),
             cached_tokens: get_u64(lp, "cached_tokens") + get_u64(rp, "cached_tokens"),
+            last_error,
         });
     }
     rows
