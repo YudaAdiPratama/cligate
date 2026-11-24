@@ -129,6 +129,14 @@ fn find_cli_bin(name: &str, env_key: &str) -> String {
     name.to_string()
 }
 
+fn parse_bool_flag(raw: &str) -> Option<bool> {
+    match raw.trim().to_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" | "enable" | "enabled" => Some(true),
+        "0" | "false" | "off" | "no" | "disable" | "disabled" => Some(false),
+        _ => None,
+    }
+}
+
 #[derive(Clone)]
 struct Config {
     host: String,
@@ -143,6 +151,7 @@ struct Config {
     sticky_ttl_sec: f64,
     max_sticky_sessions: usize,
     cooldown_sec: f64,
+    fallback_enabled: Option<bool>,
 }
 
 impl Config {
@@ -179,6 +188,9 @@ impl Config {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(900.0);
+        let fallback_enabled = env::var("CLIGATE_FALLBACK")
+            .ok()
+            .and_then(|v| parse_bool_flag(&v));
 
         Self {
             host,
@@ -193,6 +205,7 @@ impl Config {
             sticky_ttl_sec,
             max_sticky_sessions,
             cooldown_sec,
+            fallback_enabled,
         }
     }
 }
@@ -370,7 +383,7 @@ fn strip_effort_suffix(model: &str) -> (String, Option<String>) {
 
 pub fn resolve_agy_model(raw_model: &str, reasoning_effort: &str, default_model: &str) -> String {
     let mut model = raw_model.trim();
-    if model.is_empty() {
+    if model.is_empty() || matches!(model.to_lowercase().as_str(), "default" | "auto") {
         model = default_model;
     }
     if let Some((_, rest)) = model.split_once('/') {
@@ -450,7 +463,7 @@ pub fn resolve_claude_model_and_effort(
 
 pub fn detect_primary_provider(raw_model: &str, default_model: &str) -> (String, String) {
     let mut model = raw_model.trim();
-    if model.is_empty() {
+    if model.is_empty() || matches!(model.to_lowercase().as_str(), "default" | "auto") {
         model = default_model;
     }
     if let Some((prefix, rest)) = model.split_once('/') {
@@ -1688,6 +1701,7 @@ fn save_agent_routes(path: &str, data: &Json) -> Result<(), String> {
 }
 
 struct RouterState {
+    fallback_enabled: bool,
     fallback_order: Vec<String>,
     cooldown_until: HashMap<String, f64>,
     last_error: HashMap<String, String>,
@@ -1711,10 +1725,18 @@ impl ProviderRouter {
             last_error.insert(p.to_string(), String::new());
             provider_calls.insert(p.to_string(), 0);
         }
+        let routes = load_agent_routes(&cfg.routes_path);
+        let fallback_enabled = cfg.fallback_enabled.unwrap_or_else(|| {
+            routes
+                .get("fallback_enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true)
+        });
         Self {
             cfg,
             sticky,
             state: Mutex::new(RouterState {
+                fallback_enabled,
                 fallback_order: vec!["claude".to_string(), "codex".to_string(), "agy".to_string()],
                 cooldown_until,
                 last_error,
@@ -1722,6 +1744,18 @@ impl ProviderRouter {
                 fallback_events: Vec::new(),
             }),
         }
+    }
+
+    pub fn is_fallback_enabled(&self) -> bool {
+        self.state.lock().unwrap().fallback_enabled
+    }
+
+    pub fn set_fallback_enabled(&self, enabled: bool) -> Result<(), String> {
+        let mut st = self.state.lock().unwrap();
+        st.fallback_enabled = enabled;
+        let mut routes = load_agent_routes(&self.cfg.routes_path);
+        routes.set("fallback_enabled", Json::Bool(enabled));
+        save_agent_routes(&self.cfg.routes_path, &routes)
     }
 
     pub fn mark_limited(&self, provider: &str, reason: &str, cooldown_sec: f64) {
@@ -1829,6 +1863,10 @@ impl ProviderRouter {
     ) -> Vec<(String, String)> {
         let (primary_provider, bare_req) =
             detect_primary_provider(requested_model, &self.cfg.default_model);
+        let fallback_on = self.is_fallback_enabled();
+        if explicit_chain.is_none() && !fallback_on {
+            return vec![(primary_provider, bare_req)];
+        }
         let mut raw_targets: Vec<(String, String)> = Vec::new();
 
         if let Some(chain) = explicit_chain {
@@ -2033,6 +2071,7 @@ impl ProviderRouter {
         let recent_start = st.fallback_events.len().saturating_sub(10);
         let recent = st.fallback_events[recent_start..].to_vec();
         Json::obj(vec![
+            ("fallback_enabled", Json::Bool(st.fallback_enabled)),
             (
                 "fallback_order",
                 Json::Arr(st.fallback_order.iter().cloned().map(Json::Str).collect()),
@@ -2185,6 +2224,15 @@ fn handle_client(
             return;
         }
 
+        if path == "/v1/router/fallback" {
+            let payload = Json::obj(vec![
+                ("fallback_enabled", Json::Bool(router.is_fallback_enabled())),
+                ("default_model", Json::Str(cfg.default_model.clone())),
+            ]);
+            send_json_response(&mut stream, 200, "OK", &payload);
+            return;
+        }
+
         if path == "/v1/router/agents" {
             let routes = load_agent_routes(&cfg.routes_path);
             send_json_response(&mut stream, 200, "OK", &routes);
@@ -2260,6 +2308,51 @@ fn handle_client(
             let prov = parsed.get("provider").and_then(|v| v.as_str());
             let status = router.reset_cooldown(prov);
             send_json_response(&mut stream, 200, "OK", &status);
+            return;
+        }
+
+        if path == "/v1/router/fallback" {
+            let Ok(parsed) = parse_json(&req.body) else {
+                send_json_response(
+                    &mut stream,
+                    400,
+                    "Bad Request",
+                    &Json::obj(vec![(
+                        "error",
+                        Json::obj(vec![("message", Json::Str("Invalid JSON".to_string()))]),
+                    )]),
+                );
+                return;
+            };
+            let Some(enabled) = parsed.get("enabled").and_then(|v| v.as_bool()) else {
+                send_json_response(
+                    &mut stream,
+                    400,
+                    "Bad Request",
+                    &Json::obj(vec![(
+                        "error",
+                        Json::obj(vec![(
+                            "message",
+                            Json::Str("Field 'enabled' (boolean) is required".to_string()),
+                        )]),
+                    )]),
+                );
+                return;
+            };
+            match router.set_fallback_enabled(enabled) {
+                Ok(()) => {
+                    let status = router.status();
+                    send_json_response(&mut stream, 200, "OK", &status);
+                }
+                Err(e) => {
+                    send_json_response(
+                        &mut stream,
+                        500,
+                        "Internal Server Error",
+                        &Json::obj(vec![("error", Json::obj(vec![("message", Json::Str(e))]))]),
+                    );
+                }
+            }
             return;
         }
 
@@ -2354,10 +2447,14 @@ fn handle_client(
         }
 
         let effort = extract_effort(&body_json);
-        let default_for_turn = router
-            .get_agent_config(agent_name.as_deref())
-            .and_then(|(_, chain)| chain.into_iter().next())
-            .unwrap_or_else(|| cfg.default_model.clone());
+        let default_for_turn = if router.is_fallback_enabled() {
+            router
+                .get_agent_config(agent_name.as_deref())
+                .and_then(|(_, chain)| chain.into_iter().next())
+                .unwrap_or_else(|| cfg.default_model.clone())
+        } else {
+            cfg.default_model.clone()
+        };
         let requested_model = body_json
             .get("model")
             .and_then(|v| v.as_str())
@@ -2592,12 +2689,20 @@ fn handle_client(
     }
 }
 
-fn run_server(mut cfg: Config, host_override: Option<String>, port_override: Option<u16>) {
+fn run_server(
+    mut cfg: Config,
+    host_override: Option<String>,
+    port_override: Option<u16>,
+    fallback_override: Option<bool>,
+) {
     if let Some(h) = host_override {
         cfg.host = h;
     }
     if let Some(p) = port_override {
         cfg.port = p;
+    }
+    if let Some(fb) = fallback_override {
+        cfg.fallback_enabled = Some(fb);
     }
     let _ = fs::create_dir_all(&cfg.workdir);
     let standby = Arc::new(StandbyModelPool::new(cfg.clone()));
@@ -2615,8 +2720,10 @@ fn run_server(mut cfg: Config, host_override: Option<String>, port_override: Opt
         std::process::exit(1);
     });
     println!(
-        "[cligate] Listening on http://{bind_addr}/v1 (default_model={}, max_prompt_bytes={})",
-        cfg.default_model, cfg.max_prompt_bytes
+        "[cligate] Listening on http://{bind_addr}/v1 (default_model={}, fallback={}, max_prompt_bytes={})",
+        cfg.default_model,
+        if router.is_fallback_enabled() { "on" } else { "off" },
+        cfg.max_prompt_bytes
     );
 
     for stream in listener.incoming().flatten() {
@@ -2854,7 +2961,8 @@ fn print_help() {
          cligate [-c|--continue] [-r|--resume [id]] [-a <agent>] [-m <model>] [-e <level>]\n  \
          cligate tui [-c] [-r [id]] [-a <agent>] [-m <model>] [-e <level>]\n  \
          cligate ask [-a <agent>] [-m <model>] [-e <level>] <prompt>\n  \
-         cligate serve [--host 127.0.0.1] [--port 8787]       Start OpenAI HTTP gateway server\n  \
+         cligate serve [--host 127.0.0.1] [--port 8787] [--no-fallback]\n  \
+         cligate fallback [on|off|status]                     Toggle or inspect API fallback routing\n  \
          cligate status                                       Show live router health, cooldowns & cache\n  \
          cligate models [claude|codex|agy]                    List native models & supported effort levels\n  \
          cligate reset [claude|codex|agy]                     Reset provider rate-limit cooldowns\n  \
@@ -2951,6 +3059,7 @@ fn main() {
         "serve" => {
             let mut host_ov = None;
             let mut port_ov = None;
+            let mut fb_ov = None;
             let mut i = 1;
             while i < args.len() {
                 if args[i] == "--host" && i + 1 < args.len() {
@@ -2959,11 +3068,63 @@ fn main() {
                 } else if args[i] == "--port" && i + 1 < args.len() {
                     port_ov = args[i + 1].parse().ok();
                     i += 2;
+                } else if args[i] == "--no-fallback" {
+                    fb_ov = Some(false);
+                    i += 1;
+                } else if args[i] == "--fallback" && i + 1 < args.len() {
+                    fb_ov = parse_bool_flag(&args[i + 1]);
+                    i += 2;
                 } else {
                     i += 1;
                 }
             }
-            run_server(cfg, host_ov, port_ov);
+            run_server(cfg, host_ov, port_ov, fb_ov);
+        }
+        "fallback" => {
+            let arg = args.get(1).map(|s| s.as_str()).unwrap_or("status");
+            if arg == "status" {
+                if let Ok(resp) = http_call(&cfg.host, cfg.port, "GET", "/v1/router/status", None) {
+                    let on = resp
+                        .get("fallback_enabled")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    println!("API fallback: {} (live)", if on { "on" } else { "off" });
+                } else {
+                    let routes = load_agent_routes(&cfg.routes_path);
+                    let on = cfg.fallback_enabled.unwrap_or_else(|| {
+                        routes
+                            .get("fallback_enabled")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true)
+                    });
+                    println!("API fallback: {} (saved)", if on { "on" } else { "off" });
+                }
+            } else if let Some(enabled) = parse_bool_flag(arg) {
+                let mut routes = load_agent_routes(&cfg.routes_path);
+                routes.set("fallback_enabled", Json::Bool(enabled));
+                if let Err(e) = save_agent_routes(&cfg.routes_path, &routes) {
+                    eprintln!("Error saving {}: {e}", cfg.routes_path);
+                    std::process::exit(1);
+                }
+                let body = Json::obj(vec![("enabled", Json::Bool(enabled))]);
+                let live = http_call(
+                    &cfg.host,
+                    cfg.port,
+                    "POST",
+                    "/v1/router/fallback",
+                    Some(&body),
+                )
+                .is_ok();
+                println!(
+                    "API fallback: {} (saved: {}, live synced: {})",
+                    if enabled { "on" } else { "off" },
+                    cfg.routes_path,
+                    if live { "yes" } else { "no" }
+                );
+            } else {
+                eprintln!("Usage: cligate fallback [on|off|status]");
+                std::process::exit(1);
+            }
         }
         "status" => match http_call(&cfg.host, cfg.port, "GET", "/v1/router/status", None) {
             Ok(resp) => println!("{}", resp.dump_pretty()),
@@ -3151,6 +3312,58 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("run_command")
         );
+    }
+
+    #[test]
+    fn test_api_fallback_off_uses_default_provider_only() {
+        let tmp_path = env::temp_dir()
+            .join("cligate_rust_test_fallback_off.json")
+            .to_string_lossy()
+            .into_owned();
+        let _ = fs::remove_file(&tmp_path);
+        let mut cfg = test_config(&tmp_path);
+        cfg.default_model = "gemini-4-neon".to_string();
+        let standby = Arc::new(StandbyModelPool::new(cfg.clone()));
+        let sticky = Arc::new(StickySessionManager::new(cfg.clone(), standby));
+        let router = ProviderRouter::new(cfg, sticky);
+
+        router
+            .set_agent_chain(
+                "coder",
+                &[
+                    "claude-opus-5-5".to_string(),
+                    "gpt-6.1-sol".to_string(),
+                    "gemini-4-neon".to_string(),
+                ],
+                Some("high"),
+            )
+            .unwrap();
+        router.set_fallback_enabled(false).unwrap();
+        router.mark_limited("claude", "429 usage_limit_reached", 600.0);
+
+        let cands_default = router.build_target_candidates("default", Some("coder"));
+        assert_eq!(
+            cands_default,
+            vec![("agy".to_string(), "gemini-4-neon".to_string())]
+        );
+
+        let cands_explicit_model = router.build_target_candidates("claude-opus-5-5", Some("coder"));
+        assert_eq!(
+            cands_explicit_model,
+            vec![("claude".to_string(), "claude-opus-5-5".to_string())]
+        );
+
+        let tui_chain = vec!["gpt-6.1-sol".to_string(), "gemini-4-neon".to_string()];
+        let cands_tui =
+            router.build_target_candidates_with_chain("gpt-6.1-sol", None, Some(&tui_chain));
+        assert_eq!(
+            cands_tui,
+            vec![
+                ("codex".to_string(), "gpt-6.1-sol".to_string()),
+                ("agy".to_string(), "gemini-4-neon".to_string()),
+            ]
+        );
+        let _ = fs::remove_file(&tmp_path);
     }
 
     #[test]

@@ -80,6 +80,7 @@ You can configure `cligate` using environment variables:
 | `CLIGATE_HOST` | `127.0.0.1` | Bind address for the HTTP server. |
 | `CLIGATE_PORT` | `8787` | Listen port for the HTTP server. |
 | `CLIGATE_DEFAULT_MODEL` | `gemini-4-neon` | Default model when `model` is omitted in requests. |
+| `CLIGATE_FALLBACK` | `true` | Enable or disable automatic API fallback (`true`/`false`, `on`/`off`). When `false`, requests only use the default/requested provider without falling back. |
 | `CLIGATE_ROUTES_PATH` | `./agent_routes.json` | Path to the JSON file storing per-agent fallback chains. |
 | `CLIGATE_WORKDIR` | `~/.cache/cligate/workspace` | Isolated working directory used when spawning CLI subprocesses. |
 | `CLIGATE_COOLDOWN_SEC` | `900` | Cooldown duration in seconds (default 15 minutes) when a provider hits HTTP 429 / quota limits. |
@@ -265,9 +266,12 @@ cligate agent set coder claude-opus-5-5 gpt-6.1-sol gemini-4-neon --effort high
 cligate agent set orchestrator claude-sonnet-5-5 gpt-6.1-sol gemini-4-neon --effort medium
 ```
 
-### Inspect Live Router Status & Reset Cooldowns
+### Inspect Live Router Status, Toggle API Fallback & Reset Cooldowns
 ```bash
 cligate status
+cligate fallback status
+cligate fallback off
+cligate fallback on
 cligate reset
 cligate reset claude
 ```
@@ -283,6 +287,7 @@ cligate reset claude
 | `/v1/agents/<agent>/chat/completions` | `POST` | Agent-scoped Chat Completions using `<agent>`'s custom fallback chain. |
 | `/v1/router/status` | `GET` | Live health, provider cooldowns, recent fallback events, and sticky cache metrics. |
 | `/v1/router/agents` | `GET` / `POST` | Inspect or dynamically update per-agent fallback chains without restarting. |
+| `/v1/router/fallback` | `GET` / `POST` | Inspect or toggle API fallback routing live (`{"enabled": false}` or `{"enabled": true}`). |
 | `/v1/router/reset` | `POST` | Clear cooldown timers (`{"provider": "claude"}` or `{}` for all). |
 
 ---
