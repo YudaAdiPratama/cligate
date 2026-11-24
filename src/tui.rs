@@ -52,6 +52,33 @@ const COMMANDS: &[(&str, &str)] = &[
 ];
 const HELP_TEXT: &str = "Shortcuts\n  /model       F2 / ctrl+n   switch model and effort level\n  /effort      F3 / ctrl+t   reasoning effort\n  /setfallback [m1 m2 ...]   configure TUI-only fallback chain (or 'reset')\n  /permissions [mode]        tool permissions (ask, always-allow, read-only, reset)\n  /agent       F4 / ctrl+g   agent fallback chain\n  /compact     [focus]       compact conversation into a summary\n  /autocompact [32k|64k|off] set auto-compact token limit\n  /resume                    resume a saved session\n  /new                       start a fresh session\n  /status      F5            provider health\n  /reset       ctrl+r        clear rate-limit cooldowns\n  /clear       ctrl+l        clear conversation\n  scroll: mouse wheel, shift+up/down, PgUp/PgDn | stop: esc or ctrl+c | quit: ctrl+c x2";
 
+const SPLASH_MS: u64 = 2200;
+const REVEAL_MS: usize = 900;
+const LOGO_COLORS: [u8; 6] = [166, 172, 173, 209, 215, 216];
+const LOGO_GLYPHS: [[&str; 5]; 7] = [
+    [" ███", "█   ", "█   ", "█   ", " ███"],
+    ["█   ", "█   ", "█   ", "█   ", "████"],
+    ["███", " █ ", " █ ", " █ ", "███"],
+    [" ███", "█   ", "█ ██", "█  █", " ███"],
+    [" ██ ", "█  █", "████", "█  █", "█  █"],
+    ["███", " █ ", " █ ", " █ ", " █ "],
+    ["████", "█   ", "███ ", "█   ", "████"],
+];
+
+fn logo_rows() -> Vec<Vec<char>> {
+    (0..5)
+        .map(|r| {
+            LOGO_GLYPHS
+                .iter()
+                .map(|g| g[r])
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .collect()
+        })
+        .collect()
+}
+
 struct RawTermGuard {
     saved_state: Option<String>,
 }
@@ -768,6 +795,7 @@ struct TuiState {
     busy_since: Instant,
     stream_chars: usize,
     tick: usize,
+    opened_at: Instant,
     badges: Vec<(String, Option<i64>)>,
     notice: String,
     dirty: bool,
@@ -810,6 +838,7 @@ impl TuiState {
             busy_since: Instant::now(),
             stream_chars: 0,
             tick: 0,
+            opened_at: Instant::now(),
             badges: Vec::new(),
             notice: String::new(),
             dirty: false,
@@ -1084,25 +1113,93 @@ impl TuiState {
         };
     }
 
+    fn splash_animating(&self) -> bool {
+        self.entries.is_empty() && self.opened_at.elapsed() < Duration::from_millis(SPLASH_MS)
+    }
+
+    fn logo_lines(&self) -> Vec<String> {
+        let rows = logo_rows();
+        let width = rows.first().map(|r| r.len()).unwrap_or(0);
+        let elapsed = self.opened_at.elapsed().as_millis() as usize;
+        let animating = self.entries.is_empty() && elapsed < SPLASH_MS as usize;
+        let revealed = if animating {
+            (width * elapsed.min(REVEAL_MS) / REVEAL_MS).min(width)
+        } else {
+            width
+        };
+        let n = LOGO_COLORS.len();
+        rows.iter()
+            .map(|row| {
+                let mut s = String::new();
+                for (c, &ch) in row.iter().enumerate() {
+                    if ch == ' ' {
+                        s.push(' ');
+                    } else if c >= revealed {
+                        s.push_str("\x1b[38;5;238m░");
+                    } else {
+                        let idx = if animating {
+                            (c / 2 + self.tick) % n
+                        } else {
+                            (c * n / width.max(1)).min(n - 1)
+                        };
+                        s.push_str(&format!("\x1b[38;5;{}m█", LOGO_COLORS[idx]));
+                    }
+                }
+                s.push_str(RESET);
+                s
+            })
+            .collect()
+    }
+
     fn transcript_lines(&self, cols: usize) -> Vec<String> {
         let mut lines = Vec::new();
         let box_w = cols.saturating_sub(2).clamp(30, 64);
         let inner = box_w - 2;
-        let side = |content: String| format!("{ACCENT}│{RESET}{content}{ACCENT}│{RESET}");
+        let boxed = |plain_len: usize, styled: String| {
+            format!(
+                "{ACCENT}│{RESET}{styled}{}{ACCENT}│{RESET}",
+                " ".repeat(inner.saturating_sub(plain_len))
+            )
+        };
+        let ver = env!("CARGO_PKG_VERSION");
         lines.push(format!("{ACCENT}╭{}╮{RESET}", "─".repeat(inner)));
-        lines.push(side(format!(
-            " {ACCENT}✻{RESET} {BOLD}Welcome to cligate{RESET}{}",
-            " ".repeat(inner.saturating_sub(21))
-        )));
-        lines.push(side(" ".repeat(inner)));
-        lines.push(side(format!(
-            "{DIM}{}{RESET}",
-            pad_or_clip("  /help for shortcuts, /model to switch models", inner)
-        )));
-        lines.push(side(format!(
-            "{DIM}{}{RESET}",
-            pad_or_clip(&format!("  cwd: {}", self.cwd), inner)
-        )));
+        let title_plain = format!(" ✻ Welcome to cligate v{ver}");
+        lines.push(boxed(
+            title_plain.chars().count(),
+            format!(" {ACCENT}✻{RESET} {BOLD}Welcome to cligate{RESET} {DIM}v{ver}{RESET}"),
+        ));
+        lines.push(boxed(0, String::new()));
+        let logo = self.logo_lines();
+        let logo_w = logo_rows().first().map(|r| r.len()).unwrap_or(0);
+        if inner >= logo_w + 4 {
+            let pad_left = (inner - logo_w) / 2;
+            for l in logo {
+                lines.push(boxed(
+                    pad_left + logo_w,
+                    format!("{}{l}", " ".repeat(pad_left)),
+                ));
+            }
+            lines.push(boxed(0, String::new()));
+        }
+        let (prov, bare) = infer_provider_and_model(&self.model);
+        let info = [
+            ("model", format!("{prov}/{bare} · {}", self.effort)),
+            ("perms", self.perm_mode.as_str().to_string()),
+            ("cwd", self.cwd.clone()),
+        ];
+        for (label, value) in info {
+            let v = clip(&value, inner.saturating_sub(10));
+            lines.push(boxed(
+                9 + v.chars().count(),
+                format!("  {GRAY}{label:<6}{RESET} {v}"),
+            ));
+        }
+        lines.push(boxed(0, String::new()));
+        let hint = clip(
+            "  /help shortcuts · /model switch · /resume sessions",
+            inner,
+        );
+        lines.push(boxed(hint.chars().count(), format!("{DIM}{hint}{RESET}")));
         lines.push(format!("{ACCENT}╰{}╯{RESET}", "─".repeat(inner)));
         lines.push(String::new());
 
@@ -3113,7 +3210,7 @@ pub fn run_tui(
                         st.dirty = true;
                     }
                     let resized = st.poll_size();
-                    if st.busy || st.dirty || resized {
+                    if st.busy || st.dirty || resized || st.splash_animating() {
                         st.dirty = false;
                         st.render();
                     }
