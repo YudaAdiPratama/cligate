@@ -1326,6 +1326,18 @@ impl TuiState {
         if modal == Modal::None {
             let col = (5 + self.cursor.saturating_sub(offset)).min(box_w.saturating_sub(2));
             buf.push_str(&format!("\x1b[{input_row};{col}H\x1b[?25h"));
+        } else if let Modal::MaxWindow { selected, custom } = &modal {
+            let custom_idx = MAX_WINDOW_PRESETS.len();
+            if *selected == custom_idx {
+                let width = cols.saturating_sub(8).clamp(54, 78);
+                let height = custom_idx + 4;
+                let top = rows.saturating_sub(height) / 2 + 1;
+                let left = cols.saturating_sub(width) / 2 + 1;
+                let cur_row = top + 1 + custom_idx;
+                let cur_col =
+                    (left + 11 + custom.chars().count()).min(left + width.saturating_sub(2));
+                buf.push_str(&format!("\x1b[{cur_row};{cur_col}H\x1b[?25h"));
+            }
         }
         buf.push_str("\x1b[?2026l");
         let mut out = io::stdout();
@@ -1552,22 +1564,7 @@ impl TuiState {
                         (format!("{label}{mark}"), i == *selected)
                     })
                     .collect();
-                let is_custom_active = !MAX_WINDOW_PRESETS
-                    .iter()
-                    .any(|(v, _)| *v == self.auto_compact_tokens);
-                let input_display = if custom.is_empty() {
-                    if is_custom_active {
-                        format!(
-                            "custom  Enter value (e.g. 50k, 80000)  (active: {})",
-                            format_tokens_short(self.auto_compact_tokens)
-                        )
-                    } else {
-                        "custom  Type number (e.g. 50k, 80000)_".to_string()
-                    }
-                } else {
-                    format!("custom  {custom}_")
-                };
-                items.push((input_display, *selected == custom_idx));
+                items.push((format!("custom  {custom}"), *selected == custom_idx));
                 items.push((
                     "↑↓ choose · type digits/k/m for custom · Enter save · Esc cancel".to_string(),
                     false,
