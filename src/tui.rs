@@ -4,9 +4,9 @@ use crate::tools::{
     PermissionMode,
 };
 use crate::{
-    all_known_models, gen_hex_id, home_dir, http_call, infer_provider_and_model, is_cancelled,
-    load_agent_routes, now_sec, parse_tool_calls, request_cancel, reset_cancel, Config,
-    ProviderRouter, PROGRESS,
+    all_known_models, fnv1a_hex, gen_hex_id, home_dir, http_call, infer_provider_and_model,
+    is_cancelled, load_agent_routes, now_sec, parse_tool_calls, request_cancel, reset_cancel,
+    Config, ProviderRouter, PROGRESS,
 };
 use std::fs;
 use std::io::{self, Read, Write};
@@ -661,10 +661,10 @@ fn write_prefs(st: &TuiState) {
     let _ = fs::write(path, format!("{}\n", doc.dump_pretty()));
 }
 
-fn new_session_id() -> String {
-    let raw = gen_hex_id("");
-    let short: String = raw.chars().rev().take(8).collect();
-    format!("ses_{short}")
+pub fn new_session_id() -> String {
+    let seed = format!("{}-{}", gen_hex_id(""), std::process::id());
+    let hash = fnv1a_hex(&seed);
+    format!("ses_{}", &hash[..8])
 }
 
 pub fn list_saved_sessions() -> Vec<SessionSummary> {

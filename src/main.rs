@@ -88,7 +88,7 @@ fn gen_hex_id(prefix: &str) -> String {
     format!("{prefix}{nanos:016x}{seq:08x}")
 }
 
-fn fnv1a_hex(data: &str) -> String {
+pub fn fnv1a_hex(data: &str) -> String {
     let mut h1: u64 = 0xcbf29ce484222325;
     let mut h2: u64 = 0x84222325cbf29ce4;
     for (i, b) in data.bytes().enumerate() {
@@ -3821,5 +3821,11 @@ mod tests {
         assert_eq!(tui::parse_token_limit("1m"), Some(1_000_000));
         assert_eq!(tui::parse_token_limit("80000"), Some(80_000));
         assert_eq!(tui::parse_token_limit("abc"), None);
+        let s1 = tui::new_session_id();
+        let s2 = tui::new_session_id();
+        assert!(s1.starts_with("ses_"));
+        assert_eq!(s1.len(), 12);
+        assert_ne!(s1, s2);
+        assert_ne!(s1, "ses_10000000");
     }
 }
