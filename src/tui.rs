@@ -71,7 +71,9 @@ impl RawTermGuard {
                 }
             });
         let _ = Command::new("stty")
-            .args(["-icanon", "-echo", "min", "1", "time", "0"])
+            .args([
+                "-icanon", "-echo", "-isig", "-ixon", "min", "1", "time", "0",
+            ])
             .stdin(Stdio::inherit())
             .status();
         let mut out = io::stdout();
