@@ -235,7 +235,9 @@ cligate tui --model gemini-4-neon --effort xhigh
 Inside the TUI:
 - `F2` or `/model`: Open interactive **Model & Level Picker** (select from all 36 native `claude`, `codex`, and `agy` models, then immediately choose its reasoning effort level).
 - `F3` or `/effort`: Open interactive **Reasoning Effort Level Picker** (`low`, `medium`, `high`, `xhigh`, `max`).
-- `/permissions [ask|always-allow|read-only|reset]`: Configure tool permissions for built-in local coding tools (`read_file`, `list_files`, `write_file`, `edit_file`, `run_command`). In `ask` mode, mutating tools show an interactive approval dialog (`Allow once` / `Always allow <tool>` / `Always allow all` / `Deny`).
+- `/permissions [ask|always-allow|read-only|reset]`: Configure tool permissions for built-in local coding tools (`read_file`, `list_files`, `grep_search`, `find_files`, `read_skill`, `save_memory`, `write_file`, `edit_file`, `run_command`). In `ask` mode, mutating tools show an interactive approval dialog (`Allow once` / `Always allow <tool>` / `Always allow all` / `Deny`).
+- `/memory [show|add <note>|user <pref>|clear]`: Manage persistent TUI memory (`~/.local/share/cligate/memory/MEMORY.md` & `USER.md`), auto-injected into TUI prompts alongside project `AGENTS.md`/`CLAUDE.md` (TUI-only, never affects the API server).
+- `/skills [name]`: Browse and activate local `SKILL.md` skills from `~/.local/share/cligate/skills/` and `~/.agents/skills/` (TUI-only).
 - `/setfallback [m1 m2 m3]`: Interactively build or update a TUI-only fallback model chain (`Primary -> Fallback #1 -> Fallback #2`, or `/setfallback reset` to clear). Saved locally in `~/.local/share/cligate/prefs.json` without affecting the API server or `agent_routes.json`.
 - `F4` or `/agent`: Open interactive **Agent Fallback Chain Picker** (or type `/agent set <name> <m1> <m2> <m3> --effort <level>`).
 - `/compact [focus]`: Summarize and compact the conversation history into a concise context summary.

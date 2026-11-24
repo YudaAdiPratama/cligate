@@ -1,7 +1,7 @@
 use crate::json::{parse_json, Json};
 use crate::tools::{
-    execute_local_tool, is_read_only_tool, summarize_tool_call, tui_tool_definitions,
-    PermissionMode,
+    append_memory, build_tui_system_prompt, clear_memory, execute_local_tool, is_read_only_tool,
+    list_skills, read_memory_file, summarize_tool_call, tui_tool_definitions, PermissionMode,
 };
 use crate::{
     all_known_models, fnv1a_hex, gen_hex_id, home_dir, http_call, infer_provider_and_model,
@@ -36,6 +36,8 @@ const COMMANDS: &[(&str, &str)] = &[
         "/permissions",
         "Configure tool permissions and always-allow",
     ),
+    ("/memory", "View or edit persistent TUI memory"),
+    ("/skills", "Browse and activate local skills"),
     ("/agent", "Switch agent fallback chain"),
     ("/compact", "Summarize and compact conversation history"),
     (
@@ -50,7 +52,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/help", "Show shortcuts"),
     ("/quit", "Exit cligate"),
 ];
-const HELP_TEXT: &str = "Shortcuts\n  /model       F2 / ctrl+n   switch model and effort level\n  /effort      F3 / ctrl+t   reasoning effort\n  /setfallback [m1 m2 ...]   configure TUI-only fallback chain (or 'reset')\n  /permissions [mode]        tool permissions (ask, always-allow, read-only, reset)\n  /agent       F4 / ctrl+g   agent fallback chain\n  /compact     [focus]       compact conversation into a summary\n  /autocompact [32k|64k|off] set auto-compact token limit\n  /resume                    resume a saved session\n  /new                       start a fresh session\n  /status      F5            provider health\n  /reset       ctrl+r        clear rate-limit cooldowns\n  /clear       ctrl+l        clear conversation\n  scroll: mouse wheel, shift+up/down, PgUp/PgDn | stop: esc or ctrl+c | quit: ctrl+c x2";
+const HELP_TEXT: &str = "Shortcuts\n  /model       F2 / ctrl+n   switch model and effort level\n  /effort      F3 / ctrl+t   reasoning effort\n  /setfallback [m1 m2 ...]   configure TUI-only fallback chain (or 'reset')\n  /permissions [mode]        tool permissions (ask, always-allow, read-only, reset)\n  /memory      [add|user|clear] view or update persistent TUI memory\n  /skills      [name]        browse or toggle local SKILL.md skills\n  /agent       F4 / ctrl+g   agent fallback chain\n  /compact     [focus]       compact conversation into a summary\n  /autocompact [32k|64k|off] set auto-compact token limit\n  /resume                    resume a saved session\n  /new                       start a fresh session\n  /status      F5            provider health\n  /reset       ctrl+r        clear rate-limit cooldowns\n  /clear       ctrl+l        clear conversation\n  scroll: mouse wheel, shift+up/down, PgUp/PgDn | stop: esc or ctrl+c | quit: ctrl+c x2";
 
 const SPLASH_MS: u64 = 2200;
 const REVEAL_MS: usize = 900;
@@ -514,6 +516,9 @@ enum Modal {
         selected: usize,
         custom: String,
     },
+    Skills {
+        selected: usize,
+    },
     Session {
         selected: usize,
     },
@@ -775,6 +780,7 @@ struct TuiState {
     tui_fallback: Vec<String>,
     perm_mode: PermissionMode,
     always_allow_tools: Vec<String>,
+    active_skills: Vec<String>,
     auto_compact_tokens: usize,
     pending_perm: Option<mpsc::Sender<PermDecision>>,
     routes_path: String,
@@ -819,6 +825,7 @@ impl TuiState {
             tui_fallback: prefs.fallback_chain,
             perm_mode: prefs.perm_mode,
             always_allow_tools: prefs.always_allow_tools,
+            active_skills: Vec::new(),
             auto_compact_tokens: prefs.auto_compact_tokens,
             pending_perm: None,
             routes_path: cfg.routes_path.clone(),
@@ -1755,6 +1762,42 @@ impl TuiState {
                     &items,
                 );
             }
+            Modal::Skills { selected } => {
+                let skills = list_skills();
+                let width = cols.saturating_sub(8).clamp(50, 82);
+                let height = rows.saturating_sub(6).clamp(8, 18);
+                let list_h = height - 2;
+                let sel = (*selected).min(skills.len().saturating_sub(1));
+                let win = sel
+                    .saturating_sub(list_h / 2)
+                    .min(skills.len().saturating_sub(list_h));
+                let mut items = Vec::new();
+                if skills.is_empty() {
+                    items.push((
+                        "no skills found in ~/.local/share/cligate/skills or ~/.agents/skills"
+                            .to_string(),
+                        false,
+                    ));
+                }
+                for (i, s) in skills.iter().enumerate().skip(win).take(list_h) {
+                    let active = if self.active_skills.iter().any(|a| a == &s.name) {
+                        "[on] "
+                    } else {
+                        "     "
+                    };
+                    let line = format!("{active}{:<18} {}", clip(&s.name, 18), s.description);
+                    items.push((line, i == sel));
+                }
+                draw_box(
+                    buf,
+                    rows,
+                    cols,
+                    width,
+                    height,
+                    "Local Skills (Enter toggle · ←/Esc close)",
+                    &items,
+                );
+            }
             Modal::Session { selected } => {
                 let sessions = list_saved_sessions();
                 let width = cols.saturating_sub(8).clamp(42, 82);
@@ -2248,6 +2291,36 @@ fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
                 _ => {}
             }
         }
+        Modal::Skills { selected } => {
+            let skills = list_skills();
+            let last = skills.len().saturating_sub(1);
+            match key {
+                Key::Esc | Key::Left => st.modal = Modal::None,
+                Key::Up | Key::ScrollUp => {
+                    st.modal = Modal::Skills {
+                        selected: wrap_prev(selected, last),
+                    }
+                }
+                Key::Down | Key::ScrollDown => {
+                    st.modal = Modal::Skills {
+                        selected: wrap_next(selected, last),
+                    }
+                }
+                Key::Enter => {
+                    if let Some(s) = skills.get(selected.min(last)) {
+                        if let Some(pos) = st.active_skills.iter().position(|a| a == &s.name) {
+                            st.active_skills.remove(pos);
+                            st.note(format!("Deactivated skill '{}'", s.name));
+                        } else {
+                            st.active_skills.push(s.name.clone());
+                            st.note(format!("Activated skill '{}'", s.name));
+                        }
+                    }
+                    st.modal = Modal::None;
+                }
+                _ => {}
+            }
+        }
         Modal::Session { selected } => {
             let sessions = list_saved_sessions();
             let last = sessions.len().saturating_sub(1);
@@ -2532,7 +2605,7 @@ fn check_tool_permission(state: &Arc<Mutex<TuiState>>, tool: &str, summary: &str
 }
 
 fn start_turn(state: &Arc<Mutex<TuiState>>, router: &Arc<ProviderRouter>, text: String) {
-    let (model, effort, agent, tui_fallback, work_dir) = {
+    let (model, effort, agent, tui_fallback, work_dir, active_skills) = {
         let mut st = state.lock().unwrap();
         st.history.push(Json::obj(vec![
             ("role", Json::Str("user".to_string())),
@@ -2564,6 +2637,7 @@ fn start_turn(state: &Arc<Mutex<TuiState>>, router: &Arc<ProviderRouter>, text: 
             st.agent.clone(),
             fb,
             st.work_dir.clone(),
+            st.active_skills.clone(),
         )
     };
     let state_t = Arc::clone(state);
@@ -2575,9 +2649,7 @@ fn start_turn(state: &Arc<Mutex<TuiState>>, router: &Arc<ProviderRouter>, text: 
             ("role", Json::Str("system".to_string())),
             (
                 "content",
-                Json::Str(format!(
-                    "You are a coding assistant in working directory {work_dir}. Use the provided caller tools when you need to inspect files, edit code, or run shell commands."
-                )),
+                Json::Str(build_tui_system_prompt(&work_dir, &active_skills)),
             ),
         ]);
 
@@ -3053,6 +3125,73 @@ fn run_command(
                 }
             } else {
                 st.notice = "Usage: /autocompact [off|32k|64k|128k|200k|<tokens>]".to_string();
+            }
+        }
+        "/memory" | "/mem" => {
+            if parts.len() == 1 || parts[1] == "show" {
+                let u = read_memory_file("user");
+                let m = read_memory_file("memory");
+                let mut out = String::new();
+                if !u.trim().is_empty() {
+                    out.push_str(&format!("USER.md:\n{}\n\n", u.trim()));
+                }
+                if !m.trim().is_empty() {
+                    out.push_str(&format!("MEMORY.md:\n{}", m.trim()));
+                }
+                if out.trim().is_empty() {
+                    st.note(
+                        "Memory is empty. Use /memory add <note> or /memory user <pref>"
+                            .to_string(),
+                    );
+                } else {
+                    st.note(out.trim_end().to_string());
+                }
+            } else if parts[1] == "add" && parts.len() >= 3 {
+                let text = parts[2..].join(" ");
+                match append_memory("memory", &text) {
+                    Ok(_) => st.note(format!("Saved to MEMORY.md: {text}")),
+                    Err(e) => st.notice = e,
+                }
+            } else if parts[1] == "user" && parts.len() >= 3 {
+                let text = parts[2..].join(" ");
+                match append_memory("user", &text) {
+                    Ok(_) => st.note(format!("Saved to USER.md: {text}")),
+                    Err(e) => st.notice = e,
+                }
+            } else if parts[1] == "clear" {
+                let _ = clear_memory("memory");
+                st.note("Cleared MEMORY.md".to_string());
+            } else if parts[1] == "clear-user" {
+                let _ = clear_memory("user");
+                st.note("Cleared USER.md".to_string());
+            } else {
+                st.notice = "Usage: /memory [show | add <note> | user <pref> | clear | clear-user]"
+                    .to_string();
+            }
+        }
+        "/skills" | "/skill" => {
+            if parts.len() == 1 {
+                st.modal = Modal::Skills { selected: 0 };
+            } else if matches!(parts[1].to_lowercase().as_str(), "clear" | "reset" | "off") {
+                st.active_skills.clear();
+                st.note("Deactivated all active skills".to_string());
+            } else {
+                let target = parts[1].to_lowercase();
+                let found = list_skills()
+                    .into_iter()
+                    .find(|s| s.name.to_lowercase() == target);
+                match found {
+                    Some(s) => {
+                        if let Some(pos) = st.active_skills.iter().position(|a| a == &s.name) {
+                            st.active_skills.remove(pos);
+                            st.note(format!("Deactivated skill '{}'", s.name));
+                        } else {
+                            st.active_skills.push(s.name.clone());
+                            st.note(format!("Activated skill '{}'", s.name));
+                        }
+                    }
+                    None => st.notice = format!("Skill '{}' not found", parts[1]),
+                }
             }
         }
         "/permissions" | "/perm" | "/allow" => {

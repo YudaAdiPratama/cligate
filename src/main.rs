@@ -3774,6 +3774,28 @@ mod tests {
         );
         assert!(ok);
         assert!(out.contains("hello cligate"));
+
+        let (ok, out) = tools::execute_local_tool(
+            &cwd,
+            "grep_search",
+            &Json::obj(vec![("query", Json::Str("cligate".to_string()))]),
+        );
+        assert!(ok);
+        assert!(out.contains("hello.txt:1:"));
+
+        let (ok, out) = tools::execute_local_tool(
+            &cwd,
+            "find_files",
+            &Json::obj(vec![("pattern", Json::Str("hello".to_string()))]),
+        );
+        assert!(ok);
+        assert!(out.contains("hello.txt"));
+
+        fs::write(dir.join("AGENTS.md"), "Always keep changes minimal.\n").unwrap();
+        let proj = tools::load_project_context(&cwd);
+        assert!(proj.is_some());
+        assert_eq!(proj.unwrap().0, "AGENTS.md");
+
         let _ = fs::remove_dir_all(&dir);
     }
 
