@@ -29,7 +29,8 @@ impl RawTermGuard {
             .stdin(Stdio::inherit())
             .status();
         let mut out = io::stdout();
-        let _ = out.write_all(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[?1007h\x1b[2J\x1b[H");
+        let _ =
+            out.write_all(b"\x1b[?1049h\x1b[?1007l\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[2J\x1b[H");
         let _ = out.flush();
         Self { saved_state: saved }
     }
@@ -38,7 +39,8 @@ impl RawTermGuard {
 impl Drop for RawTermGuard {
     fn drop(&mut self) {
         let mut out = io::stdout();
-        let _ = out.write_all(b"\x1b[?1007l\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[0m\x1b[?1049l");
+        let _ = out
+            .write_all(b"\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?1007l\x1b[?25h\x1b[0m\x1b[?1049l");
         let _ = out.flush();
         let restore = match self.saved_state {
             Some(ref st) => Command::new("stty")
