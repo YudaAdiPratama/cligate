@@ -1266,7 +1266,12 @@ impl TuiState {
         let left_room = max_w.saturating_sub(right_len + 2);
         let left = clip(&left_text, left_room);
         let gap = max_w.saturating_sub(left.chars().count() + right_len + 1);
-        format!("{DIM} {left}{RESET}{}{right_styled}", " ".repeat(gap))
+        let left_style = if self.last_ctrl_c.is_some() {
+            format!("{ACCENT}{BOLD} {left}{RESET}")
+        } else {
+            format!("{DIM} {left}{RESET}")
+        };
+        format!("{left_style}{}{right_styled}", " ".repeat(gap))
     }
 
     fn render(&mut self) {
@@ -2115,12 +2120,12 @@ fn handle_key(st: &mut TuiState, key: Key) -> Action {
                 return Action::None;
             }
             if let Some(prev) = st.last_ctrl_c {
-                if prev.elapsed() <= Duration::from_secs(2) {
+                if prev.elapsed() <= Duration::from_secs(1) {
                     return Action::Quit;
                 }
             }
             st.last_ctrl_c = Some(Instant::now());
-            st.notice = "Press Ctrl+C again to quit".to_string();
+            st.notice = "Press Ctrl+C again to exit".to_string();
             return Action::None;
         }
         Key::F2 | Key::CtrlN => {
@@ -3064,6 +3069,15 @@ pub fn run_tui(
             match key {
                 None => {
                     st.tick = st.tick.wrapping_add(1);
+                    if st
+                        .last_ctrl_c
+                        .map(|t| t.elapsed() > Duration::from_secs(1))
+                        .unwrap_or(false)
+                    {
+                        st.last_ctrl_c = None;
+                        st.notice.clear();
+                        st.dirty = true;
+                    }
                     let resized = st.poll_size();
                     if st.busy || st.dirty || resized {
                         st.dirty = false;
