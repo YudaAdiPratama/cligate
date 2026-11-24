@@ -9,17 +9,58 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
 pub static PROGRESS: Mutex<String> = Mutex::new(String::new());
+static CANCELLED: AtomicBool = AtomicBool::new(false);
+static ACTIVE_CHILD_PID: AtomicU32 = AtomicU32::new(0);
 
 fn set_progress(msg: &str) {
     if let Ok(mut p) = PROGRESS.lock() {
         *p = msg.to_string();
+    }
+}
+
+pub fn reset_cancel() {
+    CANCELLED.store(false, Ordering::SeqCst);
+    ACTIVE_CHILD_PID.store(0, Ordering::SeqCst);
+}
+
+pub fn is_cancelled() -> bool {
+    CANCELLED.load(Ordering::SeqCst)
+}
+
+pub fn request_cancel() {
+    CANCELLED.store(true, Ordering::SeqCst);
+    let pid = ACTIVE_CHILD_PID.swap(0, Ordering::SeqCst);
+    if pid != 0 {
+        let _ = Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+struct ActivePidGuard;
+
+impl ActivePidGuard {
+    fn set(pid: u32) -> Self {
+        ACTIVE_CHILD_PID.store(pid, Ordering::SeqCst);
+        if is_cancelled() {
+            request_cancel();
+        }
+        Self
+    }
+}
+
+impl Drop for ActivePidGuard {
+    fn drop(&mut self) {
+        ACTIVE_CHILD_PID.store(0, Ordering::SeqCst);
     }
 }
 
@@ -281,6 +322,7 @@ fn is_rate_limit_message(text: &str) -> bool {
 enum TurnError {
     RateLimit(String),
     Runtime(String),
+    Cancelled,
 }
 
 pub fn extract_effort(req: &Json) -> String {
@@ -916,6 +958,9 @@ impl AgyWorker {
                 .read_line(&mut line)
                 .map_err(|e| TurnError::Runtime(e.to_string()))?;
             if n == 0 {
+                if is_cancelled() {
+                    return Err(TurnError::Cancelled);
+                }
                 let mut err_str = String::new();
                 if let Some(mut se) = child.stderr.take() {
                     let _ = se.read_to_string(&mut err_str);
@@ -960,6 +1005,10 @@ impl AgyWorker {
         prompt: &str,
         on_delta: &mut Option<&mut dyn FnMut(&str)>,
     ) -> Result<(String, Json, i64), TurnError> {
+        if is_cancelled() {
+            return Err(TurnError::Cancelled);
+        }
+        let _pid_guard = ActivePidGuard::set(self.child.id());
         let payload = Json::obj(vec![
             ("event", Json::Str("user".to_string())),
             (
@@ -986,6 +1035,9 @@ impl AgyWorker {
                 .read_line(&mut line)
                 .map_err(|e| TurnError::Runtime(e.to_string()))?;
             if n == 0 {
+                if is_cancelled() {
+                    return Err(TurnError::Cancelled);
+                }
                 let mut err_str = String::new();
                 if let Some(mut se) = self.child.stderr.take() {
                     let _ = se.read_to_string(&mut err_str);
@@ -1373,6 +1425,7 @@ fn execute_claude_turn(
         .spawn()
         .map_err(|e| TurnError::Runtime(format!("failed to spawn claude: {e}")))?;
 
+    let _pid_guard = ActivePidGuard::set(child.id());
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(prompt.as_bytes());
     }
@@ -1460,6 +1513,9 @@ fn execute_claude_turn(
         }
     }
     let _ = child.wait();
+    if is_cancelled() {
+        return Err(TurnError::Cancelled);
+    }
     let out = if !collected.trim().is_empty() {
         collected.trim().to_string()
     } else {
@@ -1507,6 +1563,7 @@ fn execute_codex_turn(
         .spawn()
         .map_err(|e| TurnError::Runtime(format!("failed to spawn codex: {e}")))?;
 
+    let _pid_guard = ActivePidGuard::set(child.id());
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(prompt.as_bytes());
     }
@@ -1593,6 +1650,9 @@ fn execute_codex_turn(
         }
     }
     let _ = child.wait();
+    if is_cancelled() {
+        return Err(TurnError::Cancelled);
+    }
     if !errors_out.is_empty() && messages_out.is_empty() {
         let joined = errors_out.join("; ");
         if is_rate_limit_message(&joined) {
@@ -1836,6 +1896,9 @@ impl ProviderRouter {
         let mut last_err = String::from("no candidates available");
         let mut prev_limited: Option<String> = None;
         for (idx, (provider, target_model)) in candidates.iter().enumerate() {
+            if is_cancelled() {
+                return Err("Interrupted by user".to_string());
+            }
             let progress = match &prev_limited {
                 Some(p) => format!("{p} limited, falling back to {provider}/{target_model}"),
                 None => format!("Routing to {provider}/{target_model}"),
@@ -1878,6 +1941,9 @@ impl ProviderRouter {
                         }
                     }
                     return Ok((out, usage, resolved, provider.clone()));
+                }
+                Err(TurnError::Cancelled) => {
+                    return Err("Interrupted by user".to_string());
                 }
                 Err(TurnError::RateLimit(msg)) => {
                     self.mark_limited(provider, &msg, self.cfg.cooldown_sec);

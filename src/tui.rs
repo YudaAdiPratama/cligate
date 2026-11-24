@@ -1,7 +1,7 @@
 use crate::json::Json;
 use crate::{
-    all_known_models, http_call, infer_provider_and_model, load_agent_routes, Config,
-    ProviderRouter, PROGRESS,
+    all_known_models, http_call, infer_provider_and_model, load_agent_routes, request_cancel,
+    reset_cancel, Config, ProviderRouter, PROGRESS,
 };
 use std::io::{self, Read, Write};
 use std::process::{Command, Stdio};
@@ -725,6 +725,7 @@ impl TuiState {
         if self.stream_chars == 0 && !phase.is_empty() {
             info.push_str(&format!(" · {phase}"));
         }
+        info.push_str(" · esc/ctrl+c to stop");
         let budget = cols.saturating_sub(label.chars().count() + 8);
         format!(
             "{ACCENT}{frame} {BOLD}{label}{RESET}{DIM} ({}){RESET}",
@@ -1081,7 +1082,14 @@ fn handle_key(st: &mut TuiState, key: Key) -> Action {
     st.notice.clear();
     let sugg_len = st.suggestions().len();
     match key {
-        Key::CtrlC => return Action::Quit,
+        Key::CtrlC => {
+            if st.busy {
+                request_cancel();
+                st.notice = "Stopping...".to_string();
+                return Action::None;
+            }
+            return Action::Quit;
+        }
         Key::F2 | Key::CtrlN => {
             st.modal = Modal::Model {
                 selected: 0,
@@ -1113,10 +1121,20 @@ fn handle_key(st: &mut TuiState, key: Key) -> Action {
                 st.input.remove(st.cursor);
             }
         }
-        Key::CtrlU | Key::Esc => {
+        Key::CtrlU => {
             st.input.clear();
             st.cursor = 0;
             st.sugg_sel = 0;
+        }
+        Key::Esc => {
+            if st.busy {
+                request_cancel();
+                st.notice = "Stopping...".to_string();
+            } else {
+                st.input.clear();
+                st.cursor = 0;
+                st.sugg_sel = 0;
+            }
         }
         Key::Tab => {
             if sugg_len > 0 {
@@ -1246,6 +1264,7 @@ fn start_turn(state: &Arc<Mutex<TuiState>>, router: &Arc<ProviderRouter>, text: 
         st.busy_since = Instant::now();
         st.stream_chars = 0;
         st.scroll = 0;
+        reset_cancel();
         if let Ok(mut p) = PROGRESS.lock() {
             p.clear();
         }
@@ -1299,8 +1318,18 @@ fn start_turn(state: &Arc<Mutex<TuiState>>, router: &Arc<ProviderRouter>, text: 
             }
             Err(err) => {
                 if let Some(entry) = st.entries.get_mut(idx) {
-                    entry.kind = Kind::Error;
-                    entry.text = err;
+                    if err == "Interrupted by user" {
+                        if !acc.is_empty() {
+                            entry.text = acc;
+                            entry.meta = format!("interrupted after {secs:.1}s");
+                        } else {
+                            entry.kind = Kind::Note;
+                            entry.text = "Interrupted by user".to_string();
+                        }
+                    } else {
+                        entry.kind = Kind::Error;
+                        entry.text = err;
+                    }
                 }
             }
         }
