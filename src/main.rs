@@ -1404,35 +1404,191 @@ impl StickySessionManager {
     }
 }
 
-fn execute_claude_turn(
-    cfg: &Config,
-    messages: &[Json],
-    tools: Option<&[Json]>,
-    raw_model: &str,
-    effort: &str,
-    on_delta: &mut Option<&mut dyn FnMut(&str)>,
-) -> Result<(String, Json, String), TurnError> {
-    let (model, resolved_effort) = resolve_claude_model_and_effort(raw_model, effort);
-    let prompt = build_prompt(messages, tools, cfg.max_prompt_bytes);
-    let _ = fs::create_dir_all(&cfg.workdir);
+struct CliCachedSession {
+    provider: String,
+    model: String,
+    header_key: String,
+    session_id: String,
+    msg_hashes: Vec<String>,
+    last_used: f64,
+    turns: u64,
+}
 
-    let mut child = Command::new(&cfg.claude_bin)
-        .args([
-            "-p",
-            "--setting-sources",
-            "",
-            "--tools",
-            "",
-            "--no-session-persistence",
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            "--include-partial-messages",
-            "--model",
-            &model,
-            "--effort",
-            &resolved_effort,
+struct CliSessionCacheState {
+    sessions: Vec<CliCachedSession>,
+    cache_hits: u64,
+    cache_misses: u64,
+    total_cached_tokens: i64,
+}
+
+struct CliSessionCache {
+    ttl_sec: f64,
+    max_sessions: usize,
+    state: Mutex<CliSessionCacheState>,
+}
+
+impl CliSessionCache {
+    fn new(cfg: &Config) -> Self {
+        Self {
+            ttl_sec: cfg.sticky_ttl_sec,
+            max_sessions: (cfg.max_sticky_sessions * 2).max(6),
+            state: Mutex::new(CliSessionCacheState {
+                sessions: Vec::new(),
+                cache_hits: 0,
+                cache_misses: 0,
+                total_cached_tokens: 0,
+            }),
+        }
+    }
+
+    fn evict_locked(&self, st: &mut CliSessionCacheState) {
+        let now = now_f64();
+        st.sessions.retain(|s| now - s.last_used <= self.ttl_sec);
+        while st.sessions.len() > self.max_sessions {
+            st.sessions.remove(0);
+        }
+    }
+
+    fn find_match(
+        &self,
+        provider: &str,
+        header_key: &str,
+        chat_hashes: &[String],
+    ) -> Option<(String, usize)> {
+        let mut st = self.state.lock().unwrap();
+        self.evict_locked(&mut st);
+        let mut best_len = 0usize;
+        let mut best_sid = None;
+        for s in &st.sessions {
+            if s.provider != provider || s.header_key != header_key {
+                continue;
+            }
+            let n = s.msg_hashes.len();
+            if n > 0
+                && chat_hashes.len() > n
+                && chat_hashes[..n] == s.msg_hashes[..]
+                && n > best_len
+            {
+                best_len = n;
+                best_sid = Some(s.session_id.clone());
+            }
+        }
+        best_sid.map(|sid| (sid, best_len))
+    }
+
+    fn invalidate(&self, provider: &str, session_id: &str) {
+        let mut st = self.state.lock().unwrap();
+        st.sessions
+            .retain(|s| !(s.provider == provider && s.session_id == session_id));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record(
+        &self,
+        provider: &str,
+        model: &str,
+        header_key: &str,
+        session_id: &str,
+        msg_hashes: Vec<String>,
+        was_hit: bool,
+        cached_tok: i64,
+    ) {
+        let mut st = self.state.lock().unwrap();
+        if was_hit {
+            st.cache_hits += 1;
+        } else {
+            st.cache_misses += 1;
+        }
+        if cached_tok > 0 {
+            st.total_cached_tokens += cached_tok;
+        }
+        if session_id.is_empty() {
+            return;
+        }
+        let now = now_f64();
+        if let Some(existing) = st
+            .sessions
+            .iter_mut()
+            .find(|s| s.provider == provider && s.session_id == session_id)
+        {
+            existing.msg_hashes = msg_hashes;
+            existing.last_used = now;
+            existing.turns += 1;
+        } else {
+            st.sessions.push(CliCachedSession {
+                provider: provider.to_string(),
+                model: model.to_string(),
+                header_key: header_key.to_string(),
+                session_id: session_id.to_string(),
+                msg_hashes,
+                last_used: now,
+                turns: 1,
+            });
+        }
+        self.evict_locked(&mut st);
+    }
+
+    fn stats(&self) -> Json {
+        let mut st = self.state.lock().unwrap();
+        self.evict_locked(&mut st);
+        let now = now_f64();
+        let sess_list: Vec<Json> = st
+            .sessions
+            .iter()
+            .map(|s| {
+                let idle = ((now - s.last_used) * 10.0).round() / 10.0;
+                Json::obj(vec![
+                    ("provider", Json::Str(s.provider.clone())),
+                    ("model", Json::Str(s.model.clone())),
+                    ("turns", Json::Num(s.turns as f64)),
+                    ("cached_messages", Json::Num(s.msg_hashes.len() as f64)),
+                    ("idle_sec", Json::Num(idle)),
+                ])
+            })
+            .collect();
+        Json::obj(vec![
+            ("active_sessions", Json::Num(sess_list.len() as f64)),
+            ("cache_hits", Json::Num(st.cache_hits as f64)),
+            ("cache_misses", Json::Num(st.cache_misses as f64)),
+            (
+                "total_cached_tokens",
+                Json::Num(st.total_cached_tokens as f64),
+            ),
+            ("sessions", Json::Arr(sess_list)),
         ])
+    }
+}
+
+fn run_claude_once(
+    cfg: &Config,
+    model: &str,
+    resolved_effort: &str,
+    prompt: &str,
+    resume_id: Option<&str>,
+    on_delta: &mut Option<&mut dyn FnMut(&str)>,
+) -> Result<(String, Json, String, Option<String>, i64), TurnError> {
+    let _ = fs::create_dir_all(&cfg.workdir);
+    let mut args = vec![
+        "-p".to_string(),
+        "--setting-sources".to_string(),
+        String::new(),
+        "--tools".to_string(),
+        String::new(),
+        "--output-format".to_string(),
+        "stream-json".to_string(),
+        "--verbose".to_string(),
+        "--include-partial-messages".to_string(),
+        "--model".to_string(),
+        model.to_string(),
+        "--effort".to_string(),
+        resolved_effort.to_string(),
+    ];
+    if let Some(sid) = resume_id {
+        args.push("--resume".to_string());
+        args.push(sid.to_string());
+    }
+    let mut child = Command::new(&cfg.claude_bin)
+        .args(&args)
         .current_dir(&cfg.workdir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1452,6 +1608,7 @@ fn execute_claude_turn(
 
     let mut collected = String::new();
     let mut final_result = String::new();
+    let mut captured_sid: Option<String> = resume_id.map(|s| s.to_string());
     let mut prompt_tok = 0i64;
     let mut comp_tok = 0i64;
     let mut cached_tok = 0i64;
@@ -1467,6 +1624,11 @@ fn execute_claude_turn(
         let Ok(evt) = parse_json(trimmed) else {
             continue;
         };
+        if let Some(sid) = evt.get("session_id").and_then(|v| v.as_str()) {
+            if !sid.is_empty() {
+                captured_sid = Some(sid.to_string());
+            }
+        }
         match evt.get("type").and_then(|v| v.as_str()) {
             Some("stream_event") => {
                 if let Some(se) = evt.get("event") {
@@ -1540,37 +1702,118 @@ fn execute_claude_turn(
         out,
         default_usage_json(prompt_tok, comp_tok, cached_tok),
         format!("{model} (effort={resolved_effort})"),
+        captured_sid,
+        cached_tok,
     ))
 }
 
-fn execute_codex_turn(
+fn execute_claude_turn(
     cfg: &Config,
+    cli_cache: &CliSessionCache,
     messages: &[Json],
     tools: Option<&[Json]>,
     raw_model: &str,
     effort: &str,
     on_delta: &mut Option<&mut dyn FnMut(&str)>,
 ) -> Result<(String, Json, String), TurnError> {
-    let (model, resolved_effort) = resolve_codex_model_and_effort(raw_model, effort);
-    let prompt = build_prompt(messages, tools, cfg.max_prompt_bytes);
-    let _ = fs::create_dir_all(&cfg.workdir);
+    let (model, resolved_effort) = resolve_claude_model_and_effort(raw_model, effort);
+    let system_msgs: Vec<&Json> = messages
+        .iter()
+        .filter(|m| m.get("role").and_then(|v| v.as_str()) == Some("system"))
+        .collect();
+    let chat_msgs: Vec<&Json> = messages
+        .iter()
+        .filter(|m| m.get("role").and_then(|v| v.as_str()) != Some("system"))
+        .collect();
+    let header_key = compute_header_key(&format!("{model}:{resolved_effort}"), &system_msgs, tools);
+    let chat_hashes: Vec<String> = chat_msgs.iter().map(|m| msg_fingerprint(m)).collect();
 
-    let effort_cfg = format!("model_reasoning_effort=\"{resolved_effort}\"");
-    let mut child = Command::new(&cfg.codex_bin)
-        .args([
-            "exec",
-            "--ephemeral",
-            "--skip-git-repo-check",
-            "--ignore-user-config",
-            "-s",
-            "read-only",
-            "--json",
-            "-m",
+    if let Some((sid, prefix_len)) = cli_cache.find_match("claude", &header_key, &chat_hashes) {
+        let delta_prompt = build_delta_prompt(&chat_msgs[prefix_len..], cfg.max_prompt_bytes);
+        match run_claude_once(
+            cfg,
             &model,
-            "-c",
-            &effort_cfg,
-            "-",
-        ])
+            &resolved_effort,
+            &delta_prompt,
+            Some(&sid),
+            on_delta,
+        ) {
+            Ok((out, usage, resolved, new_sid, cached_tok)) => {
+                cli_cache.record(
+                    "claude",
+                    &model,
+                    &header_key,
+                    new_sid.as_deref().unwrap_or(&sid),
+                    chat_hashes,
+                    true,
+                    cached_tok,
+                );
+                return Ok((out, usage, resolved));
+            }
+            Err(TurnError::Runtime(_)) => {
+                cli_cache.invalidate("claude", &sid);
+            }
+            Err(other) => return Err(other),
+        }
+    }
+
+    let prompt = build_prompt(messages, tools, cfg.max_prompt_bytes);
+    let (out, usage, resolved, new_sid, cached_tok) =
+        run_claude_once(cfg, &model, &resolved_effort, &prompt, None, on_delta)?;
+    cli_cache.record(
+        "claude",
+        &model,
+        &header_key,
+        new_sid.as_deref().unwrap_or(""),
+        chat_hashes,
+        false,
+        cached_tok,
+    );
+    Ok((out, usage, resolved))
+}
+
+fn run_codex_once(
+    cfg: &Config,
+    model: &str,
+    resolved_effort: &str,
+    prompt: &str,
+    resume_id: Option<&str>,
+    on_delta: &mut Option<&mut dyn FnMut(&str)>,
+) -> Result<(String, Json, String, Option<String>, i64), TurnError> {
+    let _ = fs::create_dir_all(&cfg.workdir);
+    let effort_cfg = format!("model_reasoning_effort=\"{resolved_effort}\"");
+    let mut args = vec!["exec".to_string()];
+    if let Some(tid) = resume_id {
+        args.extend([
+            "resume".to_string(),
+            "--skip-git-repo-check".to_string(),
+            "--ignore-user-config".to_string(),
+            "--json".to_string(),
+            "-m".to_string(),
+            model.to_string(),
+            "-c".to_string(),
+            effort_cfg,
+            "-c".to_string(),
+            "sandbox_mode=\"read-only\"".to_string(),
+            tid.to_string(),
+            "-".to_string(),
+        ]);
+    } else {
+        args.extend([
+            "--skip-git-repo-check".to_string(),
+            "--ignore-user-config".to_string(),
+            "-s".to_string(),
+            "read-only".to_string(),
+            "--json".to_string(),
+            "-m".to_string(),
+            model.to_string(),
+            "-c".to_string(),
+            effort_cfg,
+            "-".to_string(),
+        ]);
+    }
+    let mut child = Command::new(&cfg.codex_bin)
+        .args(&args)
         .current_dir(&cfg.workdir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1590,6 +1833,7 @@ fn execute_codex_turn(
 
     let mut messages_out = Vec::new();
     let mut errors_out = Vec::new();
+    let mut captured_tid: Option<String> = resume_id.map(|s| s.to_string());
     let mut prompt_tok = 0i64;
     let mut comp_tok = 0i64;
     let mut cached_tok = 0i64;
@@ -1606,6 +1850,13 @@ fn execute_codex_turn(
             continue;
         };
         match evt.get("type").and_then(|v| v.as_str()) {
+            Some("thread.started") => {
+                if let Some(tid) = evt.get("thread_id").and_then(|v| v.as_str()) {
+                    if !tid.is_empty() {
+                        captured_tid = Some(tid.to_string());
+                    }
+                }
+            }
             Some("item.completed") => {
                 if let Some(item) = evt.get("item") {
                     let itype = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -1679,7 +1930,74 @@ fn execute_codex_turn(
         messages_out.join("\n").trim().to_string(),
         default_usage_json(prompt_tok, comp_tok, cached_tok),
         format!("{model} (effort={resolved_effort})"),
+        captured_tid,
+        cached_tok,
     ))
+}
+
+fn execute_codex_turn(
+    cfg: &Config,
+    cli_cache: &CliSessionCache,
+    messages: &[Json],
+    tools: Option<&[Json]>,
+    raw_model: &str,
+    effort: &str,
+    on_delta: &mut Option<&mut dyn FnMut(&str)>,
+) -> Result<(String, Json, String), TurnError> {
+    let (model, resolved_effort) = resolve_codex_model_and_effort(raw_model, effort);
+    let system_msgs: Vec<&Json> = messages
+        .iter()
+        .filter(|m| m.get("role").and_then(|v| v.as_str()) == Some("system"))
+        .collect();
+    let chat_msgs: Vec<&Json> = messages
+        .iter()
+        .filter(|m| m.get("role").and_then(|v| v.as_str()) != Some("system"))
+        .collect();
+    let header_key = compute_header_key(&format!("{model}:{resolved_effort}"), &system_msgs, tools);
+    let chat_hashes: Vec<String> = chat_msgs.iter().map(|m| msg_fingerprint(m)).collect();
+
+    if let Some((tid, prefix_len)) = cli_cache.find_match("codex", &header_key, &chat_hashes) {
+        let delta_prompt = build_delta_prompt(&chat_msgs[prefix_len..], cfg.max_prompt_bytes);
+        match run_codex_once(
+            cfg,
+            &model,
+            &resolved_effort,
+            &delta_prompt,
+            Some(&tid),
+            on_delta,
+        ) {
+            Ok((out, usage, resolved, new_tid, cached_tok)) => {
+                cli_cache.record(
+                    "codex",
+                    &model,
+                    &header_key,
+                    new_tid.as_deref().unwrap_or(&tid),
+                    chat_hashes,
+                    true,
+                    cached_tok,
+                );
+                return Ok((out, usage, resolved));
+            }
+            Err(TurnError::Runtime(_)) => {
+                cli_cache.invalidate("codex", &tid);
+            }
+            Err(other) => return Err(other),
+        }
+    }
+
+    let prompt = build_prompt(messages, tools, cfg.max_prompt_bytes);
+    let (out, usage, resolved, new_tid, cached_tok) =
+        run_codex_once(cfg, &model, &resolved_effort, &prompt, None, on_delta)?;
+    cli_cache.record(
+        "codex",
+        &model,
+        &header_key,
+        new_tid.as_deref().unwrap_or(""),
+        chat_hashes,
+        false,
+        cached_tok,
+    );
+    Ok((out, usage, resolved))
 }
 
 fn load_agent_routes(path: &str) -> Json {
@@ -1716,6 +2034,7 @@ struct RouterState {
 pub struct ProviderRouter {
     cfg: Config,
     sticky: Arc<StickySessionManager>,
+    cli_cache: Arc<CliSessionCache>,
     state: Mutex<RouterState>,
 }
 
@@ -1736,9 +2055,11 @@ impl ProviderRouter {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true)
         });
+        let cli_cache = Arc::new(CliSessionCache::new(&cfg));
         Self {
             cfg,
             sticky,
+            cli_cache,
             state: Mutex::new(RouterState {
                 fallback_enabled,
                 fallback_order: vec!["claude".to_string(), "codex".to_string(), "agy".to_string()],
@@ -1997,12 +2318,24 @@ impl ProviderRouter {
                         .run_cached_turn(&resolved, messages, tools, on_delta)
                         .map(|(out, usage)| (out, usage, resolved))
                 }
-                "codex" => {
-                    execute_codex_turn(&self.cfg, messages, tools, target_model, &effort, on_delta)
-                }
-                "claude" => {
-                    execute_claude_turn(&self.cfg, messages, tools, target_model, &effort, on_delta)
-                }
+                "codex" => execute_codex_turn(
+                    &self.cfg,
+                    &self.cli_cache,
+                    messages,
+                    tools,
+                    target_model,
+                    &effort,
+                    on_delta,
+                ),
+                "claude" => execute_claude_turn(
+                    &self.cfg,
+                    &self.cli_cache,
+                    messages,
+                    tools,
+                    target_model,
+                    &effort,
+                    on_delta,
+                ),
                 _ => continue,
             };
 
@@ -2089,6 +2422,7 @@ impl ProviderRouter {
                     .unwrap_or_else(|| Json::Obj(Vec::new())),
             ),
             ("recent_fallbacks", Json::Arr(recent)),
+            ("cli_session_cache", self.cli_cache.stats()),
         ])
     }
 }
@@ -3441,6 +3775,39 @@ mod tests {
         assert!(ok);
         assert!(out.contains("hello cligate"));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cli_session_cache_prefix_matching() {
+        let cfg = Config::from_env();
+        let cache = CliSessionCache::new(&cfg);
+        let h1 = vec!["a".to_string(), "b".to_string()];
+        assert!(cache.find_match("claude", "hk1", &h1).is_none());
+
+        cache.record("claude", "claude-opus-5-5", "hk1", "sid-1", h1, false, 0);
+        let h2 = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(
+            cache.find_match("claude", "hk1", &h2),
+            Some(("sid-1".to_string(), 2))
+        );
+        assert!(cache.find_match("codex", "hk1", &h2).is_none());
+        assert!(cache.find_match("claude", "hk2", &h2).is_none());
+
+        cache.record("claude", "claude-opus-5-5", "hk1", "sid-1", h2, true, 1200);
+        let stats = cache.stats();
+        assert_eq!(stats.get("cache_hits").and_then(|v| v.as_i64()), Some(1));
+        assert_eq!(
+            stats.get("total_cached_tokens").and_then(|v| v.as_i64()),
+            Some(1200)
+        );
+        cache.invalidate("claude", "sid-1");
+        let h3 = vec![
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+            "d".to_string(),
+        ];
+        assert!(cache.find_match("claude", "hk1", &h3).is_none());
     }
 
     #[test]

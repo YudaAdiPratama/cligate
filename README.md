@@ -9,7 +9,7 @@
 - **Reasoning Effort / Thinking Level Passthrough**: Maps OpenAI `reasoning_effort` (`low`, `medium`, `high`, `xhigh`, `max`) to each CLI's native flag (`--effort` on Claude Code, `-c model_reasoning_effort=...` on Codex, `-<level>` tier on AGY).
 - **Automatic Rate-Limit / Quota Fallback (HTTP 429)**: Detects weekly/hourly usage limits on Provider A, places Provider A in cooldown, and transparently reroutes the turn to Provider B → Provider C.
 - **Per-Agent Custom Fallback Chains**: Configure distinct primary and fallback model chains per agent (e.g., `coder`: `claude-opus-5-5` → `gpt-6.1-sol` → `gemini-4-neon`).
-- **Pre-Warmed Standby Pool & Session-Sticky Delta Prompt Caching**: Keeps warm `agy` stream-json workers and sends only delta messages across multi-turn tool loops.
+- **Session-Sticky Delta Prompt Caching (All 3 Providers)**: Keeps warm `agy` stream-json workers and resumes `claude` (`--resume <session_id>`) & `codex` (`exec resume <thread_id>`) sessions, sending only delta messages across multi-turn conversations and tool loops.
 
 ---
 
