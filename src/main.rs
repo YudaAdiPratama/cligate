@@ -153,7 +153,7 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(8787);
         let default_model =
-            env::var("CLIGATE_DEFAULT_MODEL").unwrap_or_else(|_| "gemini-4-argon".to_string());
+            env::var("CLIGATE_DEFAULT_MODEL").unwrap_or_else(|_| "gemini-4-neon".to_string());
         let default_workdir = home_dir()
             .join(".cache")
             .join("cligate")
@@ -516,10 +516,8 @@ pub fn map_fallback_model(
                 "claude-sonnet-5-5".to_string()
             } else if is_fast {
                 "gemini-3.8-flash".to_string()
-            } else if is_flagship {
-                "gemini-4-neon".to_string()
             } else {
-                default_model.to_string()
+                "gemini-4-neon".to_string()
             }
         }
         "codex" => {

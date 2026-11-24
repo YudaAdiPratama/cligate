@@ -5,7 +5,7 @@
       "chain": [
         "claude-opus-5-5",
         "gpt-6.1-sol",
-        "gemini-4-argon"
+        "gemini-4-neon"
       ]
     },
     "orchestrator": {
@@ -13,7 +13,7 @@
       "chain": [
         "claude-sonnet-5-5",
         "gpt-6.1-sol",
-        "gemini-4-argon"
+        "gemini-4-neon"
       ]
     },
     "reviewer": {

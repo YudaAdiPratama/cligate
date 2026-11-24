@@ -472,6 +472,45 @@ fn sessions_dir() -> PathBuf {
         .join("sessions")
 }
 
+fn prefs_path() -> PathBuf {
+    sessions_dir()
+        .parent()
+        .map(|p| p.join("prefs.json"))
+        .unwrap_or_else(|| home_dir().join(".local/share/cligate/prefs.json"))
+}
+
+fn load_prefs() -> (Option<String>, Option<String>) {
+    let Ok(raw) = fs::read_to_string(prefs_path()) else {
+        return (None, None);
+    };
+    let Ok(doc) = parse_json(&raw) else {
+        return (None, None);
+    };
+    let m = doc
+        .get("model")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let e = doc
+        .get("effort")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    (m, e)
+}
+
+fn save_prefs(model: &str, effort: &str) {
+    let path = prefs_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let doc = Json::obj(vec![
+        ("model", Json::Str(model.to_string())),
+        ("effort", Json::Str(effort.to_string())),
+    ]);
+    let _ = fs::write(path, format!("{}\n", doc.dump_pretty()));
+}
+
 fn new_session_id() -> String {
     let raw = gen_hex_id("");
     let short: String = raw.chars().rev().take(8).collect();
@@ -565,10 +604,11 @@ struct TuiState {
 
 impl TuiState {
     fn new(cfg: &Config) -> Self {
+        let (saved_model, saved_effort) = load_prefs();
         Self {
             session_id: new_session_id(),
-            model: cfg.default_model.clone(),
-            effort: "medium".to_string(),
+            model: saved_model.unwrap_or_else(|| cfg.default_model.clone()),
+            effort: saved_effort.unwrap_or_else(|| "medium".to_string()),
             agent: None,
             routes_path: cfg.routes_path.clone(),
             cwd: display_cwd(),
@@ -1336,8 +1376,10 @@ fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
                     let eff = st.effort.clone();
                     if let Some((m, prov)) = pending_model {
                         st.model = m.clone();
+                        save_prefs(&st.model, &st.effort);
                         st.note(format!("Model set to {m} ({prov}, effort {eff})"));
                     } else {
+                        save_prefs(&st.model, &st.effort);
                         st.note(format!("Reasoning effort set to {eff}"));
                     }
                     st.modal = Modal::None;

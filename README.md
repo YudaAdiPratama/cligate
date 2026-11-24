@@ -8,7 +8,7 @@
 - **Native Model Catalogs (No Confusing Aliases)**: Exposes all native models from each CLI directly in `/v1/models`.
 - **Reasoning Effort / Thinking Level Passthrough**: Maps OpenAI `reasoning_effort` (`low`, `medium`, `high`, `xhigh`, `max`) to each CLI's native flag (`--effort` on Claude Code, `-c model_reasoning_effort=...` on Codex, `-<level>` tier on AGY).
 - **Automatic Rate-Limit / Quota Fallback (HTTP 429)**: Detects weekly/hourly usage limits on Provider A, places Provider A in cooldown, and transparently reroutes the turn to Provider B → Provider C.
-- **Per-Agent Custom Fallback Chains**: Configure distinct primary and fallback model chains per agent (e.g., `coder`: `claude-opus-5-5` → `gpt-6.1-sol` → `gemini-4-argon`).
+- **Per-Agent Custom Fallback Chains**: Configure distinct primary and fallback model chains per agent (e.g., `coder`: `claude-opus-5-5` → `gpt-6.1-sol` → `gemini-4-neon`).
 - **Pre-Warmed Standby Pool & Session-Sticky Delta Prompt Caching**: Keeps warm `agy` stream-json workers and sends only delta messages across multi-turn tool loops.
 
 ---
@@ -20,7 +20,7 @@ flowchart LR
     Client["OpenAI Client / Hermes Agent"] -->|"POST /v1/chat/completions\nPOST /v1/agents/{agent}/chat/completions"| Cligate["cligate (Rust :8787)"]
     Cligate -->|"1. Primary (e.g. claude-opus-5-5)"| Claude["claude CLI (OAuth)"]
     Cligate -->|"2. Fallback #1 on 429 (e.g. gpt-6.1-sol)"| Codex["codex CLI (OAuth)"]
-    Cligate -->|"3. Fallback #2 on 429 (e.g. gemini-4-argon)"| Agy["agy CLI (OAuth + Sticky Cache)"]
+    Cligate -->|"3. Fallback #2 on 429 (e.g. gemini-4-neon)"| Agy["agy CLI (OAuth + Sticky Cache)"]
 ```
 
 ---
@@ -79,7 +79,7 @@ You can configure `cligate` using environment variables:
 | :--- | :--- | :--- |
 | `CLIGATE_HOST` | `127.0.0.1` | Bind address for the HTTP server. |
 | `CLIGATE_PORT` | `8787` | Listen port for the HTTP server. |
-| `CLIGATE_DEFAULT_MODEL` | `gemini-4-argon` | Default model when `model` is omitted in requests. |
+| `CLIGATE_DEFAULT_MODEL` | `gemini-4-neon` | Default model when `model` is omitted in requests. |
 | `CLIGATE_ROUTES_PATH` | `./agent_routes.json` | Path to the JSON file storing per-agent fallback chains. |
 | `CLIGATE_WORKDIR` | `~/.cache/cligate/workspace` | Isolated working directory used when spawning CLI subprocesses. |
 | `CLIGATE_COOLDOWN_SEC` | `900` | Cooldown duration in seconds (default 15 minutes) when a provider hits HTTP 429 / quota limits. |
@@ -106,7 +106,7 @@ Example `agent_routes.json`:
       "chain": [
         "claude-opus-5-5",
         "gpt-6.1-sol",
-        "gemini-4-argon"
+        "gemini-4-neon"
       ]
     },
     "orchestrator": {
@@ -114,7 +114,7 @@ Example `agent_routes.json`:
       "chain": [
         "claude-sonnet-5-5",
         "gpt-6.1-sol",
-        "gemini-4-argon"
+        "gemini-4-neon"
       ]
     },
     "reviewer": {
@@ -152,7 +152,7 @@ Restart=on-failure
 RestartSec=3
 Environment=CLIGATE_HOST=127.0.0.1
 Environment=CLIGATE_PORT=8787
-Environment=CLIGATE_DEFAULT_MODEL=gemini-4-argon
+Environment=CLIGATE_DEFAULT_MODEL=gemini-4-neon
 Environment=CLIGATE_WORKDIR=%h/cligate/workspace
 Environment=CLIGATE_ROUTES_PATH=%h/cligate/agent_routes.json
 
@@ -176,12 +176,12 @@ providers:
   agy:
     name: agy
     base_url: http://127.0.0.1:8787/v1/agents/coder
-    default_model: gemini-4-argon
+    default_model: gemini-4-neon
     api_mode: chat_completions
     models:
       gemini-4-neon: {}
       gemini-4-carbon: {}
-      gemini-4-argon: {}
+      gemini-4-neon: {}
       gemini-4-hydrogen: {}
       gemini-3.8-flash: {}
       claude-opus-5-5: {}
@@ -260,8 +260,8 @@ cligate models agy
 ### Manage Per-Agent Fallback Chains
 ```bash
 cligate agent status
-cligate agent set coder claude-opus-5-5 gpt-6.1-sol gemini-4-argon --effort high
-cligate agent set orchestrator claude-sonnet-5-5 gpt-6.1-sol gemini-4-argon --effort medium
+cligate agent set coder claude-opus-5-5 gpt-6.1-sol gemini-4-neon --effort high
+cligate agent set orchestrator claude-sonnet-5-5 gpt-6.1-sol gemini-4-neon --effort medium
 ```
 
 ### Inspect Live Router Status & Reset Cooldowns
