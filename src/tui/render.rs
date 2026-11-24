@@ -166,23 +166,6 @@ pub(super) fn display_cwd() -> String {
     }
 }
 
-pub(super) fn progress_bar(pct: usize, width: usize) -> String {
-    let filled = (pct.min(100) * width) / 100;
-    format!(
-        "{}{}",
-        "█".repeat(filled),
-        "░".repeat(width.saturating_sub(filled))
-    )
-}
-
-pub(super) fn format_dur(secs: u64) -> String {
-    if secs >= 60 {
-        format!("{}m{}s", secs / 60, secs % 60)
-    } else {
-        format!("{secs}s")
-    }
-}
-
 pub(super) fn draw_box(
     buf: &mut String,
     rows: usize,
@@ -901,88 +884,6 @@ impl TuiState {
                     width,
                     height,
                     "Local Skills (Enter toggle · ←/Esc close)",
-                    &items,
-                );
-            }
-            Modal::Usage { rows: usage_rows } => {
-                let width = cols.saturating_sub(6).clamp(58, 84);
-                let mut items: Vec<(String, bool)> = Vec::new();
-                let ctx_used = estimate_history_tokens(&self.history);
-                let ctx_max = if self.auto_compact_tokens > 0 {
-                    self.auto_compact_tokens
-                } else {
-                    200_000
-                };
-                let ctx_pct = ((ctx_used.saturating_mul(100)) / ctx_max.max(1)).min(100);
-                items.push(("Context Window".to_string(), false));
-                items.push((
-                    format!(
-                        "{} {:>3}%  ~{} / {} tokens",
-                        progress_bar(ctx_pct, 20),
-                        ctx_pct,
-                        format_tokens_short(ctx_used),
-                        format_tokens_short(ctx_max),
-                    ),
-                    false,
-                ));
-                items.push((String::new(), false));
-                for r in usage_rows {
-                    let avail_pct = if r.available {
-                        100
-                    } else {
-                        let tot = r.cooldown_total.max(1);
-                        let done = tot.saturating_sub(r.cooldown_rem);
-                        ((done * 100) / tot).min(99) as usize
-                    };
-                    let state_str = if r.available {
-                        "ready".to_string()
-                    } else {
-                        format!("limited · retry in {}", format_dur(r.cooldown_rem))
-                    };
-                    let tot_tok = r.input_tokens + r.output_tokens;
-                    let cache_part = if r.cached_tokens > 0 {
-                        let denom = (r.input_tokens + r.cached_tokens).max(1);
-                        let c_pct = ((r.cached_tokens * 100) / denom).min(100);
-                        format!(" · cache {c_pct}%")
-                    } else {
-                        String::new()
-                    };
-                    items.push((format!("{:<8} ({state_str})", r.name), false));
-                    items.push((
-                        format!(
-                            "{} {:>3}%  {} calls · {} tok{cache_part}",
-                            progress_bar(avail_pct, 20),
-                            avail_pct,
-                            r.calls,
-                            format_tokens_short(tot_tok as usize),
-                        ),
-                        false,
-                    ));
-                    if !r.available && !r.last_error.is_empty() {
-                        items.push((
-                            format!("  limit: {}", clip(&r.last_error, width.saturating_sub(14))),
-                            false,
-                        ));
-                    }
-                    items.push((String::new(), false));
-                }
-                items.push((
-                    "Server-side account quota % is not exposed by CLI tools;".to_string(),
-                    false,
-                ));
-                items.push((
-                    "bars reflect live rate-limit availability & cooldown recovery.".to_string(),
-                    false,
-                ));
-                items.push(("r refresh · ← / Esc close".to_string(), false));
-                let height = (items.len() + 2).min(rows.saturating_sub(2));
-                draw_box(
-                    buf,
-                    rows,
-                    cols,
-                    width,
-                    height,
-                    "Provider Quota & Limits (/usage)",
                     &items,
                 );
             }

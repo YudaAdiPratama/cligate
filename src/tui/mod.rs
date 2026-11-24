@@ -48,13 +48,12 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/resume", "Resume a previous session"),
     ("/new", "Start a new session"),
     ("/status", "Show provider health and cooldowns"),
-    ("/usage", "Show provider usage, limits, and progress bars"),
     ("/reset", "Clear rate-limit cooldowns"),
     ("/clear", "Clear the conversation"),
     ("/help", "Show shortcuts"),
     ("/quit", "Exit cligate"),
 ];
-const HELP_TEXT: &str = "Shortcuts\n  /model       F2 / ctrl+n   switch model and effort level\n  /effort      F3 / ctrl+t   reasoning effort\n  /setfallback [m1 m2 ...]   configure TUI-only fallback chain (or 'reset')\n  /permissions [mode]        tool permissions (ask, always-allow, read-only, reset)\n  /memory      [add|user|clear] view or update persistent TUI memory\n  /skills      [name]        browse or toggle local SKILL.md skills\n  /agent       F4 / ctrl+g   agent fallback chain\n  /compact     [focus]       compact conversation into a summary\n  /autocompact [32k|64k|off] set auto-compact token limit\n  /resume                    resume a saved session\n  /new                       start a fresh session\n  /status      F5            provider health\n  /usage                     provider limits, tokens & progress bars\n  /reset       ctrl+r        clear rate-limit cooldowns\n  /clear       ctrl+l        clear conversation\n  scroll: mouse wheel, shift+up/down, PgUp/PgDn | stop: esc or ctrl+c | quit: ctrl+c x2";
+const HELP_TEXT: &str = "Shortcuts\n  /model       F2 / ctrl+n   switch model and effort level\n  /effort      F3 / ctrl+t   reasoning effort\n  /setfallback [m1 m2 ...]   configure TUI-only fallback chain (or 'reset')\n  /permissions [mode]        tool permissions (ask, always-allow, read-only, reset)\n  /memory      [add|user|clear] view or update persistent TUI memory\n  /skills      [name]        browse or toggle local SKILL.md skills\n  /agent       F4 / ctrl+g   agent fallback chain\n  /compact     [focus]       compact conversation into a summary\n  /autocompact [32k|64k|off] set auto-compact token limit\n  /resume                    resume a saved session\n  /new                       start a fresh session\n  /status      F5            provider health\n  /reset       ctrl+r        clear rate-limit cooldowns\n  /clear       ctrl+l        clear conversation\n  scroll: mouse wheel, shift+up/down, PgUp/PgDn | stop: esc or ctrl+c | quit: ctrl+c x2";
 
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum Kind {
@@ -76,19 +75,6 @@ pub(super) enum PermDecision {
     AlwaysAllowTool,
     AlwaysAllowAll,
     Deny,
-}
-
-#[derive(Clone, PartialEq)]
-pub(super) struct ProviderUsageRow {
-    pub(super) name: String,
-    pub(super) available: bool,
-    pub(super) cooldown_rem: u64,
-    pub(super) cooldown_total: u64,
-    pub(super) calls: u64,
-    pub(super) input_tokens: u64,
-    pub(super) output_tokens: u64,
-    pub(super) cached_tokens: u64,
-    pub(super) last_error: String,
 }
 
 #[derive(Clone, PartialEq)]
@@ -125,9 +111,6 @@ pub(super) enum Modal {
     },
     Skills {
         selected: usize,
-    },
-    Usage {
-        rows: Vec<ProviderUsageRow>,
     },
     Session {
         selected: usize,
@@ -956,11 +939,6 @@ fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
                 _ => {}
             }
         }
-        Modal::Usage { .. } => match key {
-            Key::Esc | Key::Left | Key::Enter => st.modal = Modal::None,
-            Key::Char('r') | Key::Char('R') => return Action::Command("/usage".to_string()),
-            _ => {}
-        },
         Modal::Session { selected } => {
             let sessions = list_saved_sessions();
             let last = sessions.len().saturating_sub(1);
@@ -1199,51 +1177,6 @@ fn status_text(router: &ProviderRouter) -> String {
         }
     }
     out.trim_end().to_string()
-}
-
-fn collect_usage_rows(router: &Arc<ProviderRouter>, cfg: &Config) -> Vec<ProviderUsageRow> {
-    let local = router.status();
-    let remote = http_call(&cfg.host, cfg.port, "GET", "/v1/router/status", None).ok();
-    let mut rows = Vec::new();
-    for name in ["claude", "codex", "agy"] {
-        let lp = local.get("providers").and_then(|p| p.get(name));
-        let rp = remote
-            .as_ref()
-            .and_then(|r| r.get("router"))
-            .and_then(|r| r.get("providers"))
-            .and_then(|p| p.get(name));
-        let get_u64 = |src: Option<&Json>, key: &str| -> u64 {
-            src.and_then(|o| o.get(key))
-                .and_then(|v| v.as_i64())
-                .map(|v| v.max(0) as u64)
-                .unwrap_or(0)
-        };
-        let get_str = |src: Option<&Json>, key: &str| -> String {
-            src.and_then(|o| o.get(key))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string()
-        };
-        let l_rem = get_u64(lp, "cooldown_remaining_sec");
-        let r_rem = get_u64(rp, "cooldown_remaining_sec");
-        let rem = l_rem.max(r_rem);
-        let tot = get_u64(lp, "cooldown_sec").max(900);
-        let l_err = get_str(lp, "last_limit_error");
-        let r_err = get_str(rp, "last_limit_error");
-        let last_error = if !l_err.is_empty() { l_err } else { r_err };
-        rows.push(ProviderUsageRow {
-            name: name.to_string(),
-            available: rem == 0,
-            cooldown_rem: rem,
-            cooldown_total: tot,
-            calls: get_u64(lp, "calls") + get_u64(rp, "calls"),
-            input_tokens: get_u64(lp, "input_tokens") + get_u64(rp, "input_tokens"),
-            output_tokens: get_u64(lp, "output_tokens") + get_u64(rp, "output_tokens"),
-            cached_tokens: get_u64(lp, "cached_tokens") + get_u64(rp, "cached_tokens"),
-            last_error,
-        });
-    }
-    rows
 }
 
 fn check_tool_permission(state: &Arc<Mutex<TuiState>>, tool: &str, summary: &str) -> bool {
@@ -1945,11 +1878,6 @@ fn run_command(
             let _ = http_call(&cfg.host, cfg.port, "POST", "/v1/router/reset", Some(&body));
             st.refresh_badges(router);
             st.note("Rate-limit cooldowns cleared".to_string());
-        }
-        "/usage" | "/limits" | "/quota" => {
-            st.refresh_badges(router);
-            let usage_rows = collect_usage_rows(router, cfg);
-            st.modal = Modal::Usage { rows: usage_rows };
         }
         "/status" => {
             st.refresh_badges(router);
