@@ -61,7 +61,7 @@ impl RawTermGuard {
             .stdin(Stdio::inherit())
             .status();
         let mut out = io::stdout();
-        let _ = out.write_all(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[2J\x1b[H");
+        let _ = out.write_all(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[?1007h\x1b[2J\x1b[H");
         let _ = out.flush();
         Self { saved_state: saved }
     }
@@ -70,7 +70,7 @@ impl RawTermGuard {
 impl Drop for RawTermGuard {
     fn drop(&mut self) {
         let mut out = io::stdout();
-        let _ = out.write_all(b"\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[0m\x1b[?1049l");
+        let _ = out.write_all(b"\x1b[?1007l\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[0m\x1b[?1049l");
         let _ = out.flush();
         let restore = match self.saved_state {
             Some(ref st) => Command::new("stty")
@@ -155,6 +155,7 @@ enum Key {
     CtrlG,
     CtrlL,
     CtrlN,
+    CtrlP,
     CtrlR,
     CtrlT,
     CtrlU,
@@ -188,6 +189,16 @@ fn parse_escape(rx: &Receiver<u8>) -> Key {
                     return Key::Unknown;
                 };
                 if (0x40..=0x7e).contains(&b) {
+                    if b == b'M' && params.is_empty() {
+                        let cb = rx.recv_timeout(short).ok().unwrap_or(0);
+                        let _ = rx.recv_timeout(short);
+                        let _ = rx.recv_timeout(short);
+                        return match cb.saturating_sub(32) & 0x43 {
+                            64 => Key::ScrollUp,
+                            65 => Key::ScrollDown,
+                            _ => Key::Unknown,
+                        };
+                    }
                     if matches!(b, b'M' | b'm') && params.starts_with('<') {
                         if let Some(btn) = params[1..]
                             .split(';')
@@ -246,6 +257,7 @@ fn decode_key(first: u8, rx: &Receiver<u8>) -> Key {
         10 | 13 => Key::Enter,
         12 => Key::CtrlL,
         14 => Key::CtrlN,
+        16 => Key::CtrlP,
         18 => Key::CtrlR,
         20 => Key::CtrlT,
         21 => Key::CtrlU,
@@ -1464,6 +1476,17 @@ fn handle_key(st: &mut TuiState, key: Key) -> Action {
                 st.sugg_sel = 0;
             }
         }
+        Key::CtrlP => {
+            if !st.prompts.is_empty() {
+                let idx = match st.prompt_idx {
+                    None => st.prompts.len() - 1,
+                    Some(i) => i.saturating_sub(1),
+                };
+                st.prompt_idx = Some(idx);
+                st.input = st.prompts[idx].chars().collect();
+                st.cursor = st.input.len();
+            }
+        }
         Key::Up => {
             if sugg_len > 0 {
                 st.sugg_sel = if st.sugg_sel == 0 {
@@ -1471,6 +1494,8 @@ fn handle_key(st: &mut TuiState, key: Key) -> Action {
                 } else {
                     st.sugg_sel - 1
                 };
+            } else if st.input.is_empty() && st.prompt_idx.is_none() {
+                st.scroll = st.scroll.saturating_add(2);
             } else if !st.prompts.is_empty() {
                 let idx = match st.prompt_idx {
                     None => st.prompts.len() - 1,
@@ -1484,6 +1509,8 @@ fn handle_key(st: &mut TuiState, key: Key) -> Action {
         Key::Down => {
             if sugg_len > 0 {
                 st.sugg_sel = (st.sugg_sel + 1) % sugg_len;
+            } else if st.input.is_empty() && st.prompt_idx.is_none() {
+                st.scroll = st.scroll.saturating_sub(2);
             } else if let Some(i) = st.prompt_idx {
                 if i + 1 < st.prompts.len() {
                     st.prompt_idx = Some(i + 1);
