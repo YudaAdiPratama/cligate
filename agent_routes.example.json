@@ -1,0 +1,28 @@
+{
+  "agents": {
+    "coder": {
+      "effort": "high",
+      "chain": [
+        "claude-opus-5-5",
+        "gpt-6.1-sol",
+        "gemini-4-argon"
+      ]
+    },
+    "orchestrator": {
+      "effort": "medium",
+      "chain": [
+        "claude-sonnet-5-5",
+        "gpt-6.1-sol",
+        "gemini-4-argon"
+      ]
+    },
+    "reviewer": {
+      "effort": "high",
+      "chain": [
+        "gpt-6.1-terra",
+        "claude-opus-5-5",
+        "gemini-4-neon"
+      ]
+    }
+  }
+}

@@ -1,0 +1,17 @@
+[package]
+name = "cligate"
+version = "0.1.0"
+edition = "2021"
+description = "OpenAI-compatible gateway and per-agent fallback router powered by local AI CLI OAuth sessions (Claude Code, Codex, AGY) — zero API keys, zero dependencies."
+readme = "README.md"
+license = "MIT"
+authors = ["Yuda Adi Pratama <yuda@nodespark.org>"]
+repository = "https://github.com/YudaAdiPratama/cligate"
+keywords = ["openai", "gateway", "router", "oauth", "cli"]
+categories = ["command-line-utilities", "web-programming::http-server"]
+
+[[bin]]
+name = "cligate"
+path = "src/main.rs"
+
+[dependencies]
