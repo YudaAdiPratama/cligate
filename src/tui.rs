@@ -1853,7 +1853,7 @@ fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
             let models = st.filtered_models(&filter);
             let last = models.len().saturating_sub(1);
             match key {
-                Key::Esc | Key::F2 | Key::Right => st.modal = Modal::None,
+                Key::Esc | Key::F2 | Key::Left => st.modal = Modal::None,
                 Key::Up | Key::ScrollUp => {
                     st.modal = Modal::Model {
                         selected: wrap_prev(selected, last),
@@ -1913,7 +1913,7 @@ fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
             let last = levels.len().saturating_sub(1);
             match key {
                 Key::Esc | Key::F3 => st.modal = Modal::None,
-                Key::Right => {
+                Key::Left => {
                     if pending_model.is_some() {
                         st.modal = Modal::Model {
                             selected: 0,
@@ -1959,7 +1959,7 @@ fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
             let entries = st.agent_entries();
             let last = entries.len().saturating_sub(1);
             match key {
-                Key::Esc | Key::F4 | Key::Right => st.modal = Modal::None,
+                Key::Esc | Key::F4 | Key::Left => st.modal = Modal::None,
                 Key::Up | Key::ScrollUp => {
                     st.modal = Modal::Agent {
                         selected: wrap_prev(selected, last),
@@ -1998,7 +1998,7 @@ fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
             let last = models.len().saturating_sub(1);
             match key {
                 Key::Esc => st.modal = Modal::None,
-                Key::Right => {
+                Key::Left => {
                     if chain.pop().is_some() {
                         st.modal = Modal::Fallback {
                             selected: 0,
@@ -2074,7 +2074,7 @@ fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
                 3
             };
             match key {
-                Key::Esc | Key::Right => st.modal = Modal::None,
+                Key::Esc | Key::Left => st.modal = Modal::None,
                 Key::Up | Key::ScrollUp => {
                     st.modal = Modal::Permissions {
                         selected: wrap_prev(selected, max_idx),
@@ -2127,7 +2127,7 @@ fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
         } => {
             let mut decision: Option<PermDecision> = None;
             match key {
-                Key::Esc | Key::Right | Key::Char('n') | Key::Char('N') | Key::Char('4') => {
+                Key::Esc | Key::Left | Key::Char('n') | Key::Char('N') | Key::Char('4') => {
                     decision = Some(PermDecision::Deny);
                 }
                 Key::Char('y') | Key::Char('Y') | Key::Char('1') => {
@@ -2182,7 +2182,7 @@ fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
         Modal::MaxWindow { selected, custom } => {
             let custom_idx = MAX_WINDOW_PRESETS.len();
             match key {
-                Key::Esc | Key::Right => st.modal = Modal::None,
+                Key::Esc | Key::Left => st.modal = Modal::None,
                 Key::Up | Key::ScrollUp => {
                     st.modal = Modal::MaxWindow {
                         selected: wrap_prev(selected, custom_idx),
@@ -2252,7 +2252,7 @@ fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
             let sessions = list_saved_sessions();
             let last = sessions.len().saturating_sub(1);
             match key {
-                Key::Esc | Key::Right => {
+                Key::Esc | Key::Left => {
                     if st.standalone_resume {
                         return Action::Quit;
                     }
