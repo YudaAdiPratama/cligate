@@ -177,7 +177,7 @@ impl TuiState {
         Self {
             session_id: new_session_id(),
             model: prefs.model.unwrap_or_else(|| cfg.default_model.clone()),
-            effort: prefs.effort.unwrap_or_else(|| "medium".to_string()),
+            effort: prefs.effort.unwrap_or_else(|| "high".to_string()),
             agent: None,
             tui_fallback: prefs.fallback_chain,
             perm_mode: prefs.perm_mode,
@@ -1271,7 +1271,7 @@ fn start_turn(state: &Arc<Mutex<TuiState>>, router: &Arc<ProviderRouter>, text: 
             ),
         ]);
 
-        for _round in 0..12 {
+        for _round in 0..24 {
             let (snapshot, idx) = {
                 let mut st = state_t.lock().unwrap();
                 st.entries.push(Entry {

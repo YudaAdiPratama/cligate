@@ -236,7 +236,13 @@ pub fn summarize_tool_call(name: &str, args: &Json) -> String {
 
 pub fn build_tui_system_prompt(work_dir: &str, active_skills: &[String]) -> String {
     let mut parts = vec![format!(
-        "You are a coding assistant in working directory {work_dir}. Use the provided caller tools when you need to inspect files, search code, edit files, save persistent memory, read skills, or run shell commands."
+        "You are an expert senior software engineer working in {work_dir}.\n\
+         Guidelines:\n\
+         - Always inspect relevant files with read_file, grep_search, or find_files before proposing or making edits; never guess file contents.\n\
+         - Make minimal, surgical edits with edit_file (or write_file for new files) and preserve existing style.\n\
+         - After making code changes, verify them with build/lint/test commands via run_command and fix any errors before replying.\n\
+         - You may emit multiple <tool_call> blocks in a single turn to gather independent information in parallel.\n\
+         - Be concise, factual, and never fabricate file contents, line numbers, or command outputs."
     )];
 
     if let Some((fname, content)) = load_project_context(work_dir) {

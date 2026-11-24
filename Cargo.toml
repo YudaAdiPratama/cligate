@@ -1,6 +1,6 @@
 [package]
 name = "cligate"
-version = "0.3.7"
+version = "0.3.8"
 edition = "2021"
 description = "OpenAI-compatible gateway and per-agent fallback router powered by local AI CLI OAuth sessions (Claude Code, Codex, AGY) — zero API keys, zero dependencies."
 readme = "README.md"

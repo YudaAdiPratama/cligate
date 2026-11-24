@@ -166,7 +166,7 @@ impl Config {
         let max_prompt_bytes = env::var("CLIGATE_MAX_PROMPT_BYTES")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(44000);
+            .unwrap_or(180_000);
         let sticky_ttl_sec = env::var("CLIGATE_STICKY_TTL_SEC")
             .ok()
             .and_then(|s| s.parse().ok())

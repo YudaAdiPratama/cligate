@@ -204,7 +204,12 @@ pub(crate) fn compute_header_key(
 }
 
 pub(crate) fn build_prompt(messages: &[Json], tools: Option<&[Json]>, max_bytes: usize) -> String {
-    let preamble = "IMPORTANT: Answer directly as the assistant. Do NOT call any built-in CLI tools (such as view_file, run_command, grep_search, Bash, etc.); rely strictly on the conversation messages below.";
+    let has_tools = tools.map(|t| !t.is_empty()).unwrap_or(false);
+    let preamble = if has_tools {
+        "Answer as the assistant. Do NOT invoke your own host CLI built-in sandbox tools directly; instead, whenever you need to inspect files, search code, edit files, or run commands, emit <tool_call> XML blocks using the caller tools defined below."
+    } else {
+        "Answer directly as the assistant. Do NOT invoke any internal CLI tools; rely strictly on the conversation messages below."
+    };
     let system_msgs: Vec<&Json> = messages
         .iter()
         .filter(|m| m.get("role").and_then(|v| v.as_str()) == Some("system"))
@@ -246,11 +251,15 @@ pub(crate) fn build_prompt(messages: &[Json], tools: Option<&[Json]>, max_bytes:
 
     for (idx, msg) in chat_msgs.iter().rev().enumerate() {
         let mut formatted = format_message(msg);
-        if idx >= 2
+        if idx >= 6
             && msg.get("role").and_then(|v| v.as_str()) == Some("tool")
-            && formatted.len() > 2000
+            && formatted.len() > 12_000
         {
-            formatted = clip_head_tail(&formatted, 2000, "\n... [older tool output trimmed] ...\n");
+            formatted = clip_head_tail(
+                &formatted,
+                12_000,
+                "\n... [older tool output trimmed] ...\n",
+            );
         }
         if idx == 0 && formatted.len() > remaining_bytes {
             formatted = clip_head_tail(

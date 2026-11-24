@@ -84,7 +84,7 @@ You can configure `cligate` using environment variables:
 | `CLIGATE_ROUTES_PATH` | `./agent_routes.json` | Path to the JSON file storing per-agent fallback chains. |
 | `CLIGATE_WORKDIR` | `~/.cache/cligate/workspace` | Isolated working directory used when spawning CLI subprocesses. |
 | `CLIGATE_COOLDOWN_SEC` | `900` | Cooldown duration in seconds (default 15 minutes) when a provider hits HTTP 429 / quota limits. |
-| `CLIGATE_MAX_PROMPT_BYTES` | `44000` | Maximum prompt payload size in bytes before head/tail context clipping. |
+| `CLIGATE_MAX_PROMPT_BYTES` | `180000` | Maximum prompt payload size in bytes before head/tail context clipping. |
 | `CLIGATE_STICKY_TTL_SEC` | `1800` | Idle time-to-live in seconds for cached sticky `agy` sessions. |
 | `CLIGATE_MAX_STICKY_SESSIONS` | `6` | Maximum number of concurrent sticky `agy` sessions kept in memory. |
 | `CLIGATE_CLAUDE_BIN` | `claude` *(auto-detected)* | Explicit path to the `claude` CLI binary. |
