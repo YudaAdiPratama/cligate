@@ -39,7 +39,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/agent", "Switch agent fallback chain"),
     ("/compact", "Summarize and compact conversation history"),
     (
-        "/maxwindow",
+        "/autocompact",
         "Set auto-compact context window limit (or 'off')",
     ),
     ("/resume", "Resume a previous session"),
@@ -50,7 +50,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/help", "Show shortcuts"),
     ("/quit", "Exit cligate"),
 ];
-const HELP_TEXT: &str = "Shortcuts\n  /model       F2 / ctrl+n   switch model and effort level\n  /effort      F3 / ctrl+t   reasoning effort\n  /setfallback [m1 m2 ...]   configure TUI-only fallback chain (or 'reset')\n  /permissions [mode]        tool permissions (ask, always-allow, read-only, reset)\n  /agent       F4 / ctrl+g   agent fallback chain\n  /compact     [focus]       compact conversation into a summary\n  /maxwindow   [32k|64k|off] set auto-compact token limit\n  /resume                    resume a saved session\n  /new                       start a fresh session\n  /status      F5            provider health\n  /reset       ctrl+r        clear rate-limit cooldowns\n  /clear       ctrl+l        clear conversation\n  scroll: mouse wheel, shift+up/down, PgUp/PgDn | stop: esc or ctrl+c | quit: ctrl+c";
+const HELP_TEXT: &str = "Shortcuts\n  /model       F2 / ctrl+n   switch model and effort level\n  /effort      F3 / ctrl+t   reasoning effort\n  /setfallback [m1 m2 ...]   configure TUI-only fallback chain (or 'reset')\n  /permissions [mode]        tool permissions (ask, always-allow, read-only, reset)\n  /agent       F4 / ctrl+g   agent fallback chain\n  /compact     [focus]       compact conversation into a summary\n  /autocompact [32k|64k|off] set auto-compact token limit\n  /resume                    resume a saved session\n  /new                       start a fresh session\n  /status      F5            provider health\n  /reset       ctrl+r        clear rate-limit cooldowns\n  /clear       ctrl+l        clear conversation\n  scroll: mouse wheel, shift+up/down, PgUp/PgDn | stop: esc or ctrl+c | quit: ctrl+c";
 
 struct RawTermGuard {
     saved_state: Option<String>,
@@ -1556,7 +1556,7 @@ impl TuiState {
                     cols,
                     width,
                     height,
-                    "Auto-Compact Max Window (/maxwindow <val>)",
+                    "Auto-Compact Limit (/autocompact <val>)",
                     &items,
                 );
             }
@@ -2724,7 +2724,7 @@ fn run_command(
                 }
             }
         }
-        "/maxwindow" | "/autocompact" | "/window" => {
+        "/autocompact" | "/maxwindow" | "/window" => {
             if parts.len() == 1 {
                 let sel = MAX_WINDOW_PRESETS
                     .iter()
@@ -2745,7 +2745,7 @@ fn run_command(
                     ));
                 }
             } else {
-                st.notice = "Usage: /maxwindow [off|32k|64k|128k|200k|<tokens>]".to_string();
+                st.notice = "Usage: /autocompact [off|32k|64k|128k|200k|<tokens>]".to_string();
             }
         }
         "/permissions" | "/perm" | "/allow" => {
