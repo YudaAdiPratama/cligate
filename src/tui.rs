@@ -1252,6 +1252,23 @@ impl TuiState {
             right_plain.push_str(&format!("{name} {mark} "));
             right_styled.push_str(&format!("{GRAY}{name}{RESET} {color}{mark}{RESET} "));
         }
+        if self.last_ctrl_c.is_some() {
+            let msg = "Press Ctrl+C again to exit";
+            let msg_len = msg.chars().count();
+            if msg_len + 3 >= max_w {
+                return format!(
+                    "{ACCENT}{BOLD} {}{RESET}",
+                    clip(msg, max_w.saturating_sub(1))
+                );
+            }
+            let right_room = max_w.saturating_sub(msg_len + 3);
+            let right_part = clip(&right_plain, right_room);
+            let gap = max_w.saturating_sub(msg_len + 1 + right_part.chars().count());
+            return format!(
+                "{ACCENT}{BOLD} {msg}{RESET}{}{GRAY}{right_part}{RESET}",
+                " ".repeat(gap)
+            );
+        }
         let right_len = right_plain.chars().count();
         if right_len + 2 >= max_w {
             return format!("{GRAY}{}{RESET}", clip(&right_plain, max_w));
