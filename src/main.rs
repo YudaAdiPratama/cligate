@@ -294,6 +294,9 @@ fn all_known_models() -> Vec<(&'static str, &'static str, &'static [&'static str
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for &m in AGY_MODELS {
+        if CLAUDE_MODELS.contains(&m) {
+            continue;
+        }
         seen.insert(m);
         out.push((m, "agy", agy_effort_tiers(m)));
     }
@@ -3250,6 +3253,13 @@ mod tests {
             resolve_claude_model_and_effort("claude-opus-5-5", "max"),
             ("claude-opus-5-5".to_string(), "max".to_string())
         );
+        let models = all_known_models();
+        assert!(models
+            .iter()
+            .any(|(m, p, _)| *m == "claude-opus-5-5" && *p == "claude"));
+        assert!(models
+            .iter()
+            .any(|(m, p, _)| *m == "claude-sonnet-5-5" && *p == "claude"));
     }
 
     #[test]
