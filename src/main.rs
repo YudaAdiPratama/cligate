@@ -15,6 +15,13 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 static COUNTER: AtomicU64 = AtomicU64::new(1);
+pub static PROGRESS: Mutex<String> = Mutex::new(String::new());
+
+fn set_progress(msg: &str) {
+    if let Ok(mut p) = PROGRESS.lock() {
+        *p = msg.to_string();
+    }
+}
 
 fn now_sec() -> u64 {
     SystemTime::now()
@@ -1827,7 +1834,13 @@ impl ProviderRouter {
             .unwrap_or_else(|| "agy".to_string());
 
         let mut last_err = String::from("no candidates available");
+        let mut prev_limited: Option<String> = None;
         for (idx, (provider, target_model)) in candidates.iter().enumerate() {
+            let progress = match &prev_limited {
+                Some(p) => format!("{p} limited, falling back to {provider}/{target_model}"),
+                None => format!("Routing to {provider}/{target_model}"),
+            };
+            set_progress(&progress);
             let res = match provider.as_str() {
                 "agy" => {
                     let resolved =
@@ -1868,11 +1881,13 @@ impl ProviderRouter {
                 }
                 Err(TurnError::RateLimit(msg)) => {
                     self.mark_limited(provider, &msg, self.cfg.cooldown_sec);
+                    prev_limited = Some(provider.clone());
                     last_err = msg;
                 }
                 Err(TurnError::Runtime(msg)) => {
                     if is_rate_limit_message(&msg) {
                         self.mark_limited(provider, &msg, self.cfg.cooldown_sec);
+                        prev_limited = Some(provider.clone());
                     }
                     last_err = msg;
                     if idx + 1 >= candidates.len() {
@@ -2983,6 +2998,6 @@ mod tests {
     #[test]
     fn test_tui_text_wrapping() {
         let lines = tui::wrap_text_lines("hello world\nsecond line", 10);
-        assert_eq!(lines, vec!["hello worl", "d", "second lin", "e"]);
+        assert_eq!(lines, vec!["hello", "world", "second", "line"]);
     }
 }

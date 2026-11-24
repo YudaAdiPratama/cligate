@@ -1,28 +1,37 @@
 use crate::json::Json;
 use crate::{
     all_known_models, http_call, infer_provider_and_model, load_agent_routes, Config,
-    ProviderRouter,
+    ProviderRouter, PROGRESS,
 };
 use std::io::{self, Read, Write};
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
-#[derive(Clone)]
-struct ChatEntry {
-    role: String,
-    header: String,
-    text: String,
-}
-
-#[derive(Clone, PartialEq)]
-enum Modal {
-    None,
-    ModelPicker { selected: usize, filter: String },
-    EffortPicker { selected: usize },
-    AgentPicker { selected: usize },
-}
-
+const ACCENT: &str = "\x1b[38;5;173m";
+const GRAY: &str = "\x1b[38;5;244m";
+const DIM: &str = "\x1b[2m";
+const BOLD: &str = "\x1b[1m";
+const RESET: &str = "\x1b[0m";
+const CODE: &str = "\x1b[38;5;150m";
+const RED: &str = "\x1b[38;5;203m";
+const GREEN: &str = "\x1b[38;5;114m";
+const USER_BG: &str = "\x1b[48;5;236m\x1b[38;5;253m";
+const SPINNER: &[&str] = &["·", "✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳", "✢"];
 const EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+const COMMANDS: &[(&str, &str)] = &[
+    ("/model", "Switch model"),
+    ("/effort", "Set reasoning effort level"),
+    ("/agent", "Switch agent fallback chain"),
+    ("/status", "Show provider health and cooldowns"),
+    ("/reset", "Clear rate-limit cooldowns"),
+    ("/clear", "Clear the conversation"),
+    ("/help", "Show shortcuts"),
+    ("/quit", "Exit cligate"),
+];
+const HELP_TEXT: &str = "Shortcuts\n  /model   F2 / ctrl+n   switch model\n  /effort  F3 / ctrl+t   reasoning effort\n  /agent   F4 / ctrl+g   agent fallback chain\n  /status  F5            provider health\n  /reset   ctrl+r        clear rate-limit cooldowns\n  /clear   ctrl+l        clear conversation\n  PgUp/PgDn scroll, up/down prompt history, tab complete, ctrl+u clear line, ctrl+c quit";
 
 struct RawTermGuard {
     saved_state: Option<String>,
@@ -42,16 +51,13 @@ impl RawTermGuard {
                     None
                 }
             });
-
         let _ = Command::new("stty")
             .args(["-icanon", "-echo", "min", "1", "time", "0"])
             .stdin(Stdio::inherit())
             .status();
-
         let mut out = io::stdout();
         let _ = out.write_all(b"\x1b[?1049h\x1b[2J\x1b[H");
         let _ = out.flush();
-
         Self { saved_state: saved }
     }
 }
@@ -61,17 +67,17 @@ impl Drop for RawTermGuard {
         let mut out = io::stdout();
         let _ = out.write_all(b"\x1b[?25h\x1b[0m\x1b[?1049l");
         let _ = out.flush();
-        if let Some(ref st) = self.saved_state {
-            let _ = Command::new("stty")
+        let restore = match self.saved_state {
+            Some(ref st) => Command::new("stty")
                 .arg(st)
                 .stdin(Stdio::inherit())
-                .status();
-        } else {
-            let _ = Command::new("stty")
+                .status(),
+            None => Command::new("stty")
                 .arg("sane")
                 .stdin(Stdio::inherit())
-                .status();
-        }
+                .status(),
+        };
+        let _ = restore;
     }
 }
 
@@ -96,14 +102,20 @@ fn detect_term_size() -> (usize, usize) {
     (28, 100)
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 enum Key {
     Char(char),
     Enter,
+    Tab,
     Backspace,
+    Delete,
     Esc,
     Up,
     Down,
+    Left,
+    Right,
+    Home,
+    End,
     PageUp,
     PageDown,
     F2,
@@ -111,104 +123,165 @@ enum Key {
     F4,
     F5,
     CtrlC,
-    CtrlM,
-    CtrlE,
-    CtrlA,
-    CtrlR,
+    CtrlG,
     CtrlL,
+    CtrlN,
+    CtrlR,
+    CtrlT,
+    CtrlU,
     Unknown,
 }
 
-fn read_key(stdin: &mut io::Stdin) -> io::Result<Key> {
-    let mut b = [0u8; 1];
-    if stdin.read(&mut b)? == 0 {
-        return Ok(Key::CtrlC);
+fn spawn_input_thread() -> Receiver<u8> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut stdin = io::stdin().lock();
+        let mut b = [0u8; 1];
+        while let Ok(1) = stdin.read(&mut b) {
+            if tx.send(b[0]).is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+fn parse_escape(rx: &Receiver<u8>) -> Key {
+    let short = Duration::from_millis(40);
+    let Ok(b1) = rx.recv_timeout(short) else {
+        return Key::Esc;
+    };
+    match b1 {
+        b'[' => {
+            let mut params = String::new();
+            loop {
+                let Ok(b) = rx.recv_timeout(short) else {
+                    return Key::Unknown;
+                };
+                if (0x40..=0x7e).contains(&b) {
+                    return match (b as char, params.as_str()) {
+                        ('A', _) => Key::Up,
+                        ('B', _) => Key::Down,
+                        ('C', _) => Key::Right,
+                        ('D', _) => Key::Left,
+                        ('H', _) | ('~', "1") | ('~', "7") => Key::Home,
+                        ('F', _) | ('~', "4") | ('~', "8") => Key::End,
+                        ('~', "3") => Key::Delete,
+                        ('~', "5") => Key::PageUp,
+                        ('~', "6") => Key::PageDown,
+                        ('~', "12") => Key::F2,
+                        ('~', "13") => Key::F3,
+                        ('~', "14") => Key::F4,
+                        ('~', "15") => Key::F5,
+                        _ => Key::Unknown,
+                    };
+                }
+                params.push(b as char);
+            }
+        }
+        b'O' => match rx.recv_timeout(short) {
+            Ok(b'Q') => Key::F2,
+            Ok(b'R') => Key::F3,
+            Ok(b'S') => Key::F4,
+            Ok(b'H') => Key::Home,
+            Ok(b'F') => Key::End,
+            _ => Key::Unknown,
+        },
+        _ => Key::Esc,
     }
-    match b[0] {
-        3 | 17 => Ok(Key::CtrlC),
-        1 => Ok(Key::CtrlA),
-        5 => Ok(Key::CtrlE),
-        12 => Ok(Key::CtrlL),
-        18 => Ok(Key::CtrlR),
-        10 | 13 => Ok(Key::Enter),
-        127 | 8 => Ok(Key::Backspace),
-        14 => Ok(Key::CtrlM),
-        27 => {
-            let mut seq = [0u8; 5];
-            let n = stdin.read(&mut seq).unwrap_or(0);
-            if n == 0 {
-                return Ok(Key::Esc);
-            }
-            if seq[0] == b'[' {
-                if n >= 2 {
-                    match seq[1] {
-                        b'A' => return Ok(Key::Up),
-                        b'B' => return Ok(Key::Down),
-                        b'5' if n >= 3 && seq[2] == b'~' => return Ok(Key::PageUp),
-                        b'6' if n >= 3 && seq[2] == b'~' => return Ok(Key::PageDown),
-                        b'1' if n >= 4 && seq[3] == b'~' => match seq[2] {
-                            b'2' => return Ok(Key::F2),
-                            b'3' => return Ok(Key::F3),
-                            b'4' => return Ok(Key::F4),
-                            b'5' => return Ok(Key::F5),
-                            _ => {}
-                        },
-                        _ => {}
-                    }
-                }
-            } else if seq[0] == b'O' && n >= 2 {
-                match seq[1] {
-                    b'Q' => return Ok(Key::F2),
-                    b'R' => return Ok(Key::F3),
-                    b'S' => return Ok(Key::F4),
-                    _ => {}
-                }
-            }
-            Ok(Key::Esc)
-        }
-        c if (32..127).contains(&c) => Ok(Key::Char(c as char)),
-        first if first >= 0xC0 => {
-            let width = if first < 0xE0 {
+}
+
+fn decode_key(first: u8, rx: &Receiver<u8>) -> Key {
+    match first {
+        3 | 4 => Key::CtrlC,
+        1 => Key::Home,
+        5 => Key::End,
+        7 => Key::CtrlG,
+        9 => Key::Tab,
+        10 | 13 => Key::Enter,
+        12 => Key::CtrlL,
+        14 => Key::CtrlN,
+        18 => Key::CtrlR,
+        20 => Key::CtrlT,
+        21 => Key::CtrlU,
+        27 => parse_escape(rx),
+        127 | 8 => Key::Backspace,
+        c if (32..127).contains(&c) => Key::Char(c as char),
+        lead if lead >= 0xC0 => {
+            let extra = if lead < 0xE0 {
+                1
+            } else if lead < 0xF0 {
                 2
-            } else if first < 0xF0 {
-                3
             } else {
-                4
+                3
             };
-            let mut buf = vec![first];
-            let mut rest = vec![0u8; width - 1];
-            if stdin.read_exact(&mut rest).is_ok() {
-                buf.extend_from_slice(&rest);
-                if let Ok(s) = std::str::from_utf8(&buf) {
-                    if let Some(ch) = s.chars().next() {
-                        return Ok(Key::Char(ch));
-                    }
+            let mut buf = vec![lead];
+            for _ in 0..extra {
+                match rx.recv_timeout(Duration::from_millis(40)) {
+                    Ok(b) => buf.push(b),
+                    Err(_) => break,
                 }
             }
-            Ok(Key::Unknown)
+            std::str::from_utf8(&buf)
+                .ok()
+                .and_then(|s| s.chars().next())
+                .map(Key::Char)
+                .unwrap_or(Key::Unknown)
         }
-        _ => Ok(Key::Unknown),
+        _ => Key::Unknown,
+    }
+}
+
+fn next_key(rx: &Receiver<u8>, wait: Duration) -> Option<Key> {
+    match rx.recv_timeout(wait) {
+        Ok(b) => Some(decode_key(b, rx)),
+        Err(RecvTimeoutError::Timeout) => None,
+        Err(RecvTimeoutError::Disconnected) => Some(Key::CtrlC),
     }
 }
 
 pub fn wrap_text_lines(text: &str, max_width: usize) -> Vec<String> {
     let width = max_width.max(10);
     let mut out = Vec::new();
-    for raw_line in text.split('\n') {
-        if raw_line.is_empty() {
+    for raw in text.split('\n') {
+        let indent: String = raw.chars().take_while(|c| *c == ' ').collect();
+        let body = raw.trim_start_matches(' ');
+        if body.is_empty() {
             out.push(String::new());
             continue;
         }
-        let mut current = String::new();
-        for ch in raw_line.chars() {
-            if current.chars().count() >= width {
-                out.push(current);
-                current = String::new();
+        let avail = width.saturating_sub(indent.chars().count()).max(4);
+        let mut cur = String::new();
+        let mut cur_len = 0usize;
+        for word in body.split(' ') {
+            let mut w = word;
+            let mut wl = w.chars().count();
+            while wl > avail {
+                if cur_len > 0 {
+                    out.push(format!("{indent}{cur}"));
+                    cur.clear();
+                    cur_len = 0;
+                }
+                let head: String = w.chars().take(avail).collect();
+                w = &w[head.len()..];
+                out.push(format!("{indent}{head}"));
+                wl = w.chars().count();
             }
-            current.push(ch);
+            if cur_len == 0 {
+                cur.push_str(w);
+                cur_len = wl;
+            } else if cur_len + 1 + wl <= avail {
+                cur.push(' ');
+                cur.push_str(w);
+                cur_len += 1 + wl;
+            } else {
+                out.push(format!("{indent}{cur}"));
+                cur = w.to_string();
+                cur_len = wl;
+            }
         }
-        if !current.is_empty() {
-            out.push(current);
+        if cur_len > 0 {
+            out.push(format!("{indent}{cur}"));
         }
     }
     if out.is_empty() {
@@ -217,52 +290,200 @@ pub fn wrap_text_lines(text: &str, max_width: usize) -> Vec<String> {
     out
 }
 
-fn pad_or_clip(s: &str, width: usize) -> String {
-    let count = s.chars().count();
-    if count > width {
-        s.chars().take(width.saturating_sub(1)).collect::<String>() + "…"
+fn clip(s: &str, width: usize) -> String {
+    if s.chars().count() <= width {
+        s.to_string()
     } else {
-        format!("{s}{}", " ".repeat(width - count))
+        s.chars().take(width.saturating_sub(1)).collect::<String>() + "…"
     }
 }
 
-pub struct TuiState {
-    pub model: String,
-    pub effort: String,
-    pub agent: Option<String>,
+fn pad_or_clip(s: &str, width: usize) -> String {
+    let n = s.chars().count();
+    if n > width {
+        clip(s, width)
+    } else {
+        format!("{s}{}", " ".repeat(width - n))
+    }
+}
+
+fn style_inline(s: &str, code: &mut bool, bold: &mut bool) -> String {
+    let mut out = String::new();
+    if *code {
+        out.push_str(CODE);
+    }
+    if *bold {
+        out.push_str(BOLD);
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '`' {
+            *code = !*code;
+            if *code {
+                out.push_str(CODE);
+            } else {
+                out.push_str(RESET);
+                if *bold {
+                    out.push_str(BOLD);
+                }
+            }
+            i += 1;
+            continue;
+        }
+        if !*code && chars[i] == '*' && i + 1 < chars.len() && chars[i + 1] == '*' {
+            *bold = !*bold;
+            if *bold {
+                out.push_str(BOLD);
+            } else {
+                out.push_str(RESET);
+            }
+            i += 2;
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    if *code || *bold {
+        out.push_str(RESET);
+    }
+    out
+}
+
+fn display_cwd() -> String {
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| ".".to_string());
+    match std::env::var("HOME") {
+        Ok(h) if !h.is_empty() && cwd.starts_with(&h) => format!("~{}", &cwd[h.len()..]),
+        _ => cwd,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    User,
+    Assistant,
+    Note,
+    Error,
+}
+
+struct Entry {
+    kind: Kind,
+    text: String,
+    meta: String,
+}
+
+#[derive(Clone, PartialEq)]
+enum Modal {
+    None,
+    Model { selected: usize, filter: String },
+    Effort { selected: usize },
+    Agent { selected: usize },
+}
+
+enum Action {
+    None,
+    Submit(String),
+    Command(String),
+    Quit,
+}
+
+type ModelRow = (&'static str, &'static str, &'static [&'static str]);
+
+struct TuiState {
+    model: String,
+    effort: String,
+    agent: Option<String>,
+    routes_path: String,
+    cwd: String,
     history: Vec<Json>,
-    transcript: Vec<ChatEntry>,
-    input: String,
-    scroll_offset: usize,
+    entries: Vec<Entry>,
+    input: Vec<char>,
+    cursor: usize,
+    prompts: Vec<String>,
+    prompt_idx: Option<usize>,
+    scroll: usize,
     modal: Modal,
-    status_note: String,
-    provider_badges: String,
+    sugg_sel: usize,
+    busy: bool,
+    busy_since: Instant,
+    stream_chars: usize,
+    tick: usize,
+    badges: Vec<(String, Option<i64>)>,
+    notice: String,
+    dirty: bool,
+    size: (usize, usize),
+    size_at: Instant,
+    force_clear: bool,
 }
 
 impl TuiState {
-    pub fn new(cfg: &Config) -> Self {
+    fn new(cfg: &Config) -> Self {
         Self {
             model: cfg.default_model.clone(),
             effort: "medium".to_string(),
             agent: None,
+            routes_path: cfg.routes_path.clone(),
+            cwd: display_cwd(),
             history: Vec::new(),
-            transcript: vec![ChatEntry {
-                role: "system".to_string(),
-                header: "cligate TUI ready".to_string(),
-                text: "Commands: /model (or F2) switch model | /effort (or F3) switch reasoning level | /agent (or F4) switch agent fallback chain | /status (or F5) router health | /reset clear 429 cooldowns | /clear reset chat | /quit exit.".to_string(),
-            }],
-            input: String::new(),
-            scroll_offset: 0,
+            entries: Vec::new(),
+            input: Vec::new(),
+            cursor: 0,
+            prompts: Vec::new(),
+            prompt_idx: None,
+            scroll: 0,
             modal: Modal::None,
-            status_note: "Ready".to_string(),
-            provider_badges: "claude:OK codex:OK agy:OK".to_string(),
+            sugg_sel: 0,
+            busy: false,
+            busy_since: Instant::now(),
+            stream_chars: 0,
+            tick: 0,
+            badges: Vec::new(),
+            notice: String::new(),
+            dirty: false,
+            size: detect_term_size(),
+            size_at: Instant::now(),
+            force_clear: true,
         }
     }
 
-    fn filtered_models(
-        &self,
-        filter: &str,
-    ) -> Vec<(&'static str, &'static str, &'static [&'static str])> {
+    fn note(&mut self, text: String) {
+        self.entries.push(Entry {
+            kind: Kind::Note,
+            text,
+            meta: String::new(),
+        });
+        self.scroll = 0;
+    }
+
+    fn poll_size(&mut self) -> bool {
+        if self.size_at.elapsed() < Duration::from_millis(700) {
+            return false;
+        }
+        self.size_at = Instant::now();
+        let fresh = detect_term_size();
+        if fresh != self.size {
+            self.size = fresh;
+            self.force_clear = true;
+            return true;
+        }
+        false
+    }
+
+    fn suggestions(&self) -> Vec<(&'static str, &'static str)> {
+        let text: String = self.input.iter().collect();
+        if !text.starts_with('/') || text.contains(' ') {
+            return Vec::new();
+        }
+        COMMANDS
+            .iter()
+            .filter(|(c, _)| c.starts_with(text.as_str()))
+            .copied()
+            .collect()
+    }
+
+    fn filtered_models(&self, filter: &str) -> Vec<ModelRow> {
         let low = filter.trim().to_lowercase();
         all_known_models()
             .into_iter()
@@ -272,12 +493,12 @@ impl TuiState {
             .collect()
     }
 
-    fn agent_entries(&self, cfg: &Config) -> Vec<(String, String, Vec<String>)> {
-        let routes = load_agent_routes(&cfg.routes_path);
+    fn agent_entries(&self) -> Vec<(String, String, Vec<String>)> {
+        let routes = load_agent_routes(&self.routes_path);
         let mut out = vec![(
             "none".to_string(),
             "medium".to_string(),
-            vec!["(direct model routing without agent override)".to_string()],
+            vec!["direct model routing".to_string()],
         )];
         if let Some(agents) = routes.get("agents").and_then(|v| v.as_obj()) {
             for (name, info) in agents {
@@ -301,373 +522,776 @@ impl TuiState {
         out
     }
 
-    fn refresh_provider_badges(&mut self, cfg: &Config, local_router: &ProviderRouter) {
-        let st = http_call(&cfg.host, cfg.port, "GET", "/v1/router/status", None)
-            .ok()
-            .and_then(|r| r.get("router").cloned())
-            .unwrap_or_else(|| local_router.status());
-
-        if let Some(provs) = st.get("providers") {
-            let mut parts = Vec::new();
+    fn refresh_badges(&mut self, router: &ProviderRouter) {
+        let status = router.status();
+        let mut badges = Vec::new();
+        if let Some(provs) = status.get("providers") {
             for p in ["claude", "codex", "agy"] {
                 if let Some(info) = provs.get(p) {
                     let avail = info
                         .get("available")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(true);
-                    if avail {
-                        parts.push(format!("{p}:OK"));
-                    } else {
-                        let rem = info
-                            .get("cooldown_remaining_sec")
-                            .and_then(|v| v.as_i64())
-                            .unwrap_or(0);
-                        parts.push(format!("{p}:429({rem}s)"));
+                    let rem = info
+                        .get("cooldown_remaining_sec")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    badges.push((p.to_string(), if avail { None } else { Some(rem) }));
+                }
+            }
+        }
+        self.badges = badges;
+    }
+
+    fn open_effort(&mut self) {
+        let idx = EFFORT_LEVELS
+            .iter()
+            .position(|e| *e == self.effort)
+            .unwrap_or(1);
+        self.modal = Modal::Effort { selected: idx };
+    }
+
+    fn transcript_lines(&self, cols: usize) -> Vec<String> {
+        let mut lines = Vec::new();
+        let box_w = cols.saturating_sub(2).clamp(30, 64);
+        let inner = box_w - 2;
+        let side = |content: String| format!("{ACCENT}│{RESET}{content}{ACCENT}│{RESET}");
+        lines.push(format!("{ACCENT}╭{}╮{RESET}", "─".repeat(inner)));
+        lines.push(side(format!(
+            " {ACCENT}✻{RESET} {BOLD}Welcome to cligate{RESET}{}",
+            " ".repeat(inner.saturating_sub(21))
+        )));
+        lines.push(side(" ".repeat(inner)));
+        lines.push(side(format!(
+            "{DIM}{}{RESET}",
+            pad_or_clip("  /help for shortcuts, /model to switch models", inner)
+        )));
+        lines.push(side(format!(
+            "{DIM}{}{RESET}",
+            pad_or_clip(&format!("  cwd: {}", self.cwd), inner)
+        )));
+        lines.push(format!("{ACCENT}╰{}╯{RESET}", "─".repeat(inner)));
+        lines.push(String::new());
+
+        let body_w = cols.saturating_sub(4).max(10);
+        for e in &self.entries {
+            match e.kind {
+                Kind::User => {
+                    for (i, l) in wrap_text_lines(&e.text, body_w).iter().enumerate() {
+                        let prefix = if i == 0 { "> " } else { "  " };
+                        let plain = format!(" {prefix}{l}");
+                        lines.push(format!(
+                            "{USER_BG}{}{RESET}",
+                            pad_or_clip(&plain, cols.saturating_sub(1))
+                        ));
+                    }
+                }
+                Kind::Assistant => self.assistant_lines(e, body_w, &mut lines),
+                Kind::Note => {
+                    for (i, l) in wrap_text_lines(&e.text, body_w).iter().enumerate() {
+                        let prefix = if i == 0 { "⎿  " } else { "   " };
+                        lines.push(format!("{DIM}  {prefix}{l}{RESET}"));
+                    }
+                }
+                Kind::Error => {
+                    for (i, l) in wrap_text_lines(&e.text, body_w).iter().enumerate() {
+                        let prefix = if i == 0 { "✗ " } else { "  " };
+                        lines.push(format!("{RED}{prefix}{l}{RESET}"));
                     }
                 }
             }
-            if !parts.is_empty() {
-                self.provider_badges = parts.join(" ");
+            lines.push(String::new());
+        }
+        lines
+    }
+
+    fn assistant_lines(&self, e: &Entry, body_w: usize, lines: &mut Vec<String>) {
+        let mut first = true;
+        let mut lead = || {
+            if first {
+                first = false;
+                format!("{ACCENT}●{RESET} ")
+            } else {
+                "  ".to_string()
             }
+        };
+        let mut in_code = false;
+        for raw in e.text.split('\n') {
+            let trimmed = raw.trim_start();
+            if trimmed.starts_with("```") {
+                in_code = !in_code;
+                if in_code {
+                    let lang = trimmed.trim_start_matches('`').trim();
+                    if !lang.is_empty() {
+                        lines.push(format!("{}{DIM}{lang}{RESET}", lead()));
+                    }
+                }
+                continue;
+            }
+            if in_code {
+                for part in wrap_text_lines(raw, body_w) {
+                    lines.push(format!("{}{CODE}{part}{RESET}", lead()));
+                }
+                continue;
+            }
+            if trimmed.starts_with('#') {
+                let heading = trimmed.trim_start_matches('#').trim();
+                for part in wrap_text_lines(heading, body_w) {
+                    lines.push(format!("{}{BOLD}{part}{RESET}", lead()));
+                }
+                continue;
+            }
+            let text = if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
+                let indent = raw.len() - trimmed.len();
+                format!("{}• {}", " ".repeat(indent), &trimmed[2..])
+            } else {
+                raw.to_string()
+            };
+            let mut code = false;
+            let mut bold = false;
+            for part in wrap_text_lines(&text, body_w) {
+                lines.push(format!(
+                    "{}{}",
+                    lead(),
+                    style_inline(&part, &mut code, &mut bold)
+                ));
+            }
+        }
+        if !e.meta.is_empty() {
+            lines.push(format!(
+                "{DIM}  ⎿  {}{RESET}",
+                clip(&e.meta, body_w.saturating_sub(3))
+            ));
         }
     }
 
-    fn render(&self, cfg: &Config) {
-        let (rows, cols) = detect_term_size();
-        let mut buf = String::with_capacity(rows * cols * 2);
-        buf.push_str("\x1b[?25l\x1b[H");
-
-        let (prov, bare_mod) = infer_provider_and_model(&self.model);
-        let ag_label = self.agent.as_deref().unwrap_or("none");
-        let top_bar = format!(
-            " cligate TUI | Agent: {ag_label} | Model: {prov}/{bare_mod} | Effort: {} | Providers: {} ",
-            self.effort, self.provider_badges
-        );
-        buf.push_str("\x1b[1;37;44m");
-        buf.push_str(&pad_or_clip(&top_bar, cols));
-        buf.push_str("\x1b[0m\r\n");
-
-        let chat_height = rows.saturating_sub(5);
-        let inner_w = cols.saturating_sub(4);
-        let mut rendered_lines: Vec<(String, &'static str)> = Vec::new();
-
-        for entry in &self.transcript {
-            let (badge_color, prefix) = match entry.role.as_str() {
-                "user" => ("\x1b[1;32m", "You"),
-                "assistant" => ("\x1b[1;36m", "Assistant"),
-                _ => ("\x1b[1;33m", "System"),
-            };
-            let hdr = if entry.header.is_empty() {
-                format!("┌─ {prefix}")
-            } else {
-                format!("┌─ {prefix} ({})", entry.header)
-            };
-            rendered_lines.push((pad_or_clip(&hdr, cols.saturating_sub(2)), badge_color));
-            for wline in wrap_text_lines(&entry.text, inner_w) {
-                rendered_lines.push((format!("│ {}", pad_or_clip(&wline, inner_w)), "\x1b[0m"));
-            }
-            rendered_lines.push((String::new(), "\x1b[0m"));
+    fn spinner_line(&self, cols: usize) -> String {
+        if !self.busy {
+            return String::new();
         }
-
-        let total_lines = rendered_lines.len();
-        let max_scroll = total_lines.saturating_sub(chat_height);
-        let effective_scroll = self.scroll_offset.min(max_scroll);
-        let start_idx = total_lines
-            .saturating_sub(chat_height)
-            .saturating_sub(effective_scroll);
-        let end_idx = (start_idx + chat_height).min(total_lines);
-
-        for row_idx in 0..chat_height {
-            let line_idx = start_idx + row_idx;
-            if line_idx < end_idx {
-                let (ref txt, color) = rendered_lines[line_idx];
-                buf.push_str(color);
-                buf.push(' ');
-                buf.push_str(&pad_or_clip(txt, cols.saturating_sub(1)));
-                buf.push_str("\x1b[0m\r\n");
-            } else {
-                buf.push_str(&" ".repeat(cols));
-                buf.push_str("\r\n");
-            }
-        }
-
-        let status_line = format!(
-            " Status: {} | Scroll: +{} lines ",
-            self.status_note, effective_scroll
-        );
-        buf.push_str("\x1b[30;47m");
-        buf.push_str(&pad_or_clip(&status_line, cols));
-        buf.push_str("\x1b[0m\r\n");
-
-        let prompt_prefix = " > ";
-        let avail_input = cols.saturating_sub(prompt_prefix.len() + 1);
-        let input_tail: String = if self.input.chars().count() > avail_input {
-            let skip = self.input.chars().count() - avail_input;
-            self.input.chars().skip(skip).collect()
+        let secs = self.busy_since.elapsed().as_secs();
+        let frame = SPINNER[self.tick % SPINNER.len()];
+        let phase = PROGRESS.lock().map(|p| p.clone()).unwrap_or_default();
+        let label = if self.stream_chars == 0 {
+            "Thinking…"
         } else {
-            self.input.clone()
+            "Writing…"
         };
-        buf.push_str("\x1b[1;32m");
-        buf.push_str(prompt_prefix);
-        buf.push_str("\x1b[0m");
-        buf.push_str(&pad_or_clip(&input_tail, avail_input));
-        buf.push_str("\r\n");
+        let mut info = format!("{secs}s");
+        let tokens = self.stream_chars / 4;
+        if tokens > 0 {
+            info.push_str(&format!(" · ↓ {tokens} tokens"));
+        }
+        if self.stream_chars == 0 && !phase.is_empty() {
+            info.push_str(&format!(" · {phase}"));
+        }
+        let budget = cols.saturating_sub(label.chars().count() + 8);
+        format!(
+            "{ACCENT}{frame} {BOLD}{label}{RESET}{DIM} ({}){RESET}",
+            clip(&info, budget)
+        )
+    }
 
-        let help_bar = " [Enter] Send  [F2|/model] Model  [F3|/effort] Level  [F4|/agent] Agent  [F5|/status] Health  [/reset] Clear 429  [Ctrl+C] Quit ";
-        buf.push_str("\x1b[1;37;100m");
-        buf.push_str(&pad_or_clip(help_bar, cols));
-        buf.push_str("\x1b[0m");
+    fn status_line(&self, cols: usize) -> String {
+        let (prov, bare) = infer_provider_and_model(&self.model);
+        let agent = self.agent.as_deref().unwrap_or("no agent");
+        let mut right_plain = format!("{prov}/{bare} · {} · {agent}   ", self.effort);
+        let mut right_styled = format!("{GRAY}{right_plain}{RESET}");
+        for (name, state) in &self.badges {
+            let (mark, color) = match state {
+                None => ("●", GREEN),
+                Some(_) => ("✗", RED),
+            };
+            right_plain.push_str(&format!("{name} {mark} "));
+            right_styled.push_str(&format!("{GRAY}{name}{RESET} {color}{mark}{RESET} "));
+        }
+        let left_text = if !self.notice.is_empty() {
+            self.notice.clone()
+        } else if self.scroll > 0 {
+            format!("scrolled up {} lines, PgDn to return", self.scroll)
+        } else {
+            "/help for shortcuts, ctrl+c to quit".to_string()
+        };
+        let right_len = right_plain.chars().count();
+        let left_room = cols.saturating_sub(right_len + 3);
+        let left = clip(&left_text, left_room);
+        let gap = cols.saturating_sub(left.chars().count() + right_len + 2);
+        format!("{DIM} {left}{RESET}{}{right_styled}", " ".repeat(gap))
+    }
 
-        match &self.modal {
-            Modal::None => {}
-            Modal::ModelPicker { selected, filter } => {
-                let models = self.filtered_models(filter);
-                let box_w = (cols.saturating_sub(10)).clamp(36, 74);
-                let box_h = (rows.saturating_sub(6)).clamp(8, 18);
-                let start_r = (rows.saturating_sub(box_h)) / 2;
-                let start_c = (cols.saturating_sub(box_w)) / 2;
-                let title = format!(
-                    " Select Native Model (Filter: '{}' | ↑/↓/Enter/Esc) ",
-                    filter
-                );
-                draw_modal_box(&mut buf, start_r, start_c, box_w, box_h, &title, |list_h| {
-                    let mut rows_out = Vec::new();
-                    if models.is_empty() {
-                        rows_out.push(("  (No matching models)".to_string(), false));
-                        return rows_out;
-                    }
-                    let sel = (*selected).min(models.len() - 1);
-                    let win_start = sel.saturating_sub(list_h / 2);
-                    for (idx, (m, prov, efforts)) in
-                        models.iter().enumerate().skip(win_start).take(list_h)
-                    {
-                        let line =
-                            format!(" {:<28} [{:<6}] levels: {}", m, prov, efforts.join(","));
-                        rows_out.push((line, idx == sel));
-                    }
-                    rows_out
-                });
-            }
-            Modal::EffortPicker { selected } => {
-                let box_w = 52.min(cols.saturating_sub(6));
-                let box_h = 9;
-                let start_r = (rows.saturating_sub(box_h)) / 2;
-                let start_c = (cols.saturating_sub(box_w)) / 2;
-                let title = " Select Reasoning Effort Level (↑/↓/Enter/Esc) ";
-                draw_modal_box(&mut buf, start_r, start_c, box_w, box_h, title, |_| {
-                    EFFORT_LEVELS
-                        .iter()
-                        .enumerate()
-                        .map(|(i, lvl)| {
-                            let desc = match *lvl {
-                                "low" => "Fastest response, minimal thinking",
-                                "medium" => "Balanced speed and reasoning (default)",
-                                "high" => "Deep thinking for coding & debugging",
-                                "xhigh" => "Extra-high reasoning depth",
-                                "max" => "Maximum reasoning budget",
-                                _ => "",
-                            };
-                            (format!(" {:<8} - {desc}", lvl), i == *selected)
-                        })
-                        .collect()
-                });
-            }
-            Modal::AgentPicker { selected } => {
-                let entries = self.agent_entries(cfg);
-                let box_w = (cols.saturating_sub(8)).clamp(40, 78);
-                let box_h = (rows.saturating_sub(6)).clamp(8, 16);
-                let start_r = (rows.saturating_sub(box_h)) / 2;
-                let start_c = (cols.saturating_sub(box_w)) / 2;
-                let title = " Select Agent Fallback Chain (↑/↓/Enter/Esc) ";
-                draw_modal_box(&mut buf, start_r, start_c, box_w, box_h, title, |list_h| {
-                    let sel = (*selected).min(entries.len().saturating_sub(1));
-                    let win_start = sel.saturating_sub(list_h / 2);
-                    entries
-                        .iter()
-                        .enumerate()
-                        .skip(win_start)
-                        .take(list_h)
-                        .map(|(i, (name, eff, chain))| {
-                            let line = format!(
-                                " {:<14} (effort={:<6}) -> {}",
-                                name,
-                                eff,
-                                chain.join(" -> ")
-                            );
-                            (line, i == sel)
-                        })
-                        .collect()
-                });
+    fn render(&mut self) {
+        let (rows, cols) = self.size;
+        let suggestions = self.suggestions();
+        let sugg_rows = suggestions.len().min(8);
+        let bottom = 1 + 3 + sugg_rows + 1;
+        let chat_h = rows.saturating_sub(bottom);
+        let lines = self.transcript_lines(cols);
+        let max_scroll = lines.len().saturating_sub(chat_h);
+        if self.scroll > max_scroll {
+            self.scroll = max_scroll;
+        }
+        let end = lines.len() - self.scroll;
+        let start = end.saturating_sub(chat_h);
+        let visible = &lines[start..end];
+
+        let mut buf = String::with_capacity(rows * cols * 2);
+        buf.push_str("\x1b[?2026h\x1b[?25l");
+        if self.force_clear {
+            buf.push_str("\x1b[2J");
+            self.force_clear = false;
+        }
+        for r in 0..chat_h {
+            let content = visible.get(r).map(String::as_str).unwrap_or("");
+            buf.push_str(&format!("\x1b[{};1H{content}\x1b[K", r + 1));
+        }
+        buf.push_str(&format!(
+            "\x1b[{};1H{}\x1b[K",
+            chat_h + 1,
+            self.spinner_line(cols)
+        ));
+
+        let border = if self.busy { DIM } else { GRAY };
+        let avail = cols.saturating_sub(6).max(1);
+        let offset = if self.cursor >= avail {
+            self.cursor + 1 - avail
+        } else {
+            0
+        };
+        let shown: String = self.input.iter().skip(offset).take(avail).collect();
+        let shown_len = shown.chars().count();
+        let field = if self.input.is_empty() {
+            let hint = clip("Try \"/model\" to switch models", avail);
+            let pad = " ".repeat(avail - hint.chars().count() + 1);
+            format!("{DIM}{hint}{RESET}{pad}")
+        } else {
+            format!("{shown}{}", " ".repeat(avail - shown_len + 1))
+        };
+        buf.push_str(&format!(
+            "\x1b[{};1H{border}╭{}╮{RESET}\x1b[K",
+            chat_h + 2,
+            "─".repeat(cols.saturating_sub(2))
+        ));
+        buf.push_str(&format!(
+            "\x1b[{};1H{border}│{RESET} {ACCENT}>{RESET} {field}{border}│{RESET}\x1b[K",
+            chat_h + 3
+        ));
+        buf.push_str(&format!(
+            "\x1b[{};1H{border}╰{}╯{RESET}\x1b[K",
+            chat_h + 4,
+            "─".repeat(cols.saturating_sub(2))
+        ));
+
+        let sel = self.sugg_sel.min(suggestions.len().saturating_sub(1));
+        for (i, (cmd, desc)) in suggestions.iter().take(8).enumerate() {
+            let plain = pad_or_clip(&format!("{cmd:<10} {desc}"), cols.saturating_sub(5));
+            let row = chat_h + 5 + i;
+            if i == sel {
+                buf.push_str(&format!(
+                    "\x1b[{row};1H  {ACCENT}{BOLD}› {plain}{RESET}\x1b[K"
+                ));
+            } else {
+                buf.push_str(&format!("\x1b[{row};1H  {GRAY}  {plain}{RESET}\x1b[K"));
             }
         }
+        buf.push_str(&format!("\x1b[{rows};1H{}\x1b[K", self.status_line(cols)));
 
-        let cursor_row = rows.saturating_sub(1);
-        let cursor_col = (prompt_prefix.len() + input_tail.chars().count() + 1).min(cols);
-        buf.push_str(&format!("\x1b[{cursor_row};{cursor_col}H\x1b[?25h"));
+        let modal = self.modal.clone();
+        self.draw_modal(&mut buf, &modal, rows, cols);
 
+        if modal == Modal::None {
+            let col = 5 + (self.cursor - offset);
+            buf.push_str(&format!("\x1b[{};{}H\x1b[?25h", chat_h + 3, col));
+        }
+        buf.push_str("\x1b[?2026l");
         let mut out = io::stdout();
         let _ = out.write_all(buf.as_bytes());
         let _ = out.flush();
     }
+
+    fn draw_modal(&self, buf: &mut String, modal: &Modal, rows: usize, cols: usize) {
+        match modal {
+            Modal::None => {}
+            Modal::Model { selected, filter } => {
+                let models = self.filtered_models(filter);
+                let width = cols.saturating_sub(10).clamp(40, 76);
+                let height = rows.saturating_sub(6).clamp(8, 18);
+                let list_h = height - 2;
+                let sel = (*selected).min(models.len().saturating_sub(1));
+                let win = sel
+                    .saturating_sub(list_h / 2)
+                    .min(models.len().saturating_sub(list_h));
+                let mut items = Vec::new();
+                if models.is_empty() {
+                    items.push(("no matching models".to_string(), false));
+                }
+                for (idx, (m, prov, efforts)) in models.iter().enumerate().skip(win).take(list_h) {
+                    items.push((
+                        format!("{m:<28} {prov:<6} {}", efforts.join("/")),
+                        idx == sel,
+                    ));
+                }
+                let title = format!("Select model  filter: {filter}");
+                draw_box(buf, rows, cols, width, height, &title, &items);
+            }
+            Modal::Effort { selected } => {
+                let items: Vec<(String, bool)> = EFFORT_LEVELS
+                    .iter()
+                    .enumerate()
+                    .map(|(i, lvl)| {
+                        let desc = match *lvl {
+                            "low" => "fastest, minimal thinking",
+                            "medium" => "balanced speed and reasoning",
+                            "high" => "deep thinking for coding",
+                            "xhigh" => "extra-high reasoning depth",
+                            _ => "maximum reasoning budget",
+                        };
+                        (format!("{lvl:<7} {desc}"), i == *selected)
+                    })
+                    .collect();
+                let width = cols.saturating_sub(6).clamp(30, 56);
+                draw_box(buf, rows, cols, width, 9, "Reasoning effort", &items);
+            }
+            Modal::Agent { selected } => {
+                let entries = self.agent_entries();
+                let width = cols.saturating_sub(8).clamp(40, 80);
+                let height = rows.saturating_sub(6).clamp(8, 16);
+                let list_h = height - 2;
+                let sel = (*selected).min(entries.len().saturating_sub(1));
+                let win = sel
+                    .saturating_sub(list_h / 2)
+                    .min(entries.len().saturating_sub(list_h));
+                let items: Vec<(String, bool)> = entries
+                    .iter()
+                    .enumerate()
+                    .skip(win)
+                    .take(list_h)
+                    .map(|(i, (name, eff, chain))| {
+                        (
+                            format!("{name:<14} {eff:<6} {}", chain.join(" -> ")),
+                            i == sel,
+                        )
+                    })
+                    .collect();
+                draw_box(
+                    buf,
+                    rows,
+                    cols,
+                    width,
+                    height,
+                    "Agent fallback chain",
+                    &items,
+                );
+            }
+        }
+    }
 }
 
-fn draw_modal_box<F>(
+fn draw_box(
     buf: &mut String,
-    top_r: usize,
-    left_c: usize,
+    rows: usize,
+    cols: usize,
     width: usize,
     height: usize,
     title: &str,
-    build_rows: F,
-) where
-    F: FnOnce(usize) -> Vec<(String, bool)>,
-{
-    let inner_w = width.saturating_sub(2);
-    let list_h = height.saturating_sub(2);
-    let rows = build_rows(list_h);
-
-    let top_border = format!("┌{}┐", pad_or_clip(title, inner_w).replace(' ', "─"));
+    items: &[(String, bool)],
+) {
+    let top = rows.saturating_sub(height) / 2 + 1;
+    let left = cols.saturating_sub(width) / 2 + 1;
+    let inner = width.saturating_sub(2);
+    let head = clip(&format!("─ {title} "), inner);
+    let rest = inner.saturating_sub(head.chars().count());
     buf.push_str(&format!(
-        "\x1b[{};{}H\x1b[1;37;45m{}\x1b[0m",
-        top_r, left_c, top_border
+        "\x1b[{top};{left}H{ACCENT}╭{head}{}╮{RESET}",
+        "─".repeat(rest)
     ));
-
-    for i in 0..list_h {
-        let r = top_r + 1 + i;
-        buf.push_str(&format!("\x1b[{r};{left_c}H"));
-        if let Some((ref text, is_sel)) = rows.get(i) {
-            if *is_sel {
-                buf.push_str("\x1b[1;30;46m│");
-                buf.push_str(&pad_or_clip(text, inner_w));
-                buf.push_str("│\x1b[0m");
-            } else {
-                buf.push_str("\x1b[37;40m│");
-                buf.push_str(&pad_or_clip(text, inner_w));
-                buf.push_str("│\x1b[0m");
-            }
-        } else {
-            buf.push_str("\x1b[37;40m│");
-            buf.push_str(&" ".repeat(inner_w));
-            buf.push_str("│\x1b[0m");
-        }
+    for i in 0..height.saturating_sub(2) {
+        let row = top + 1 + i;
+        let line = match items.get(i) {
+            Some((text, true)) => format!(
+                "{ACCENT}│{BOLD}{}{RESET}{ACCENT}│{RESET}",
+                pad_or_clip(&format!("❯ {text}"), inner)
+            ),
+            Some((text, false)) => format!(
+                "{ACCENT}│{RESET}{}{ACCENT}│{RESET}",
+                pad_or_clip(&format!("  {text}"), inner)
+            ),
+            None => format!("{ACCENT}│{RESET}{}{ACCENT}│{RESET}", " ".repeat(inner)),
+        };
+        buf.push_str(&format!("\x1b[{row};{left}H{line}"));
     }
-
-    let bot_r = top_r + height - 1;
+    let bottom = top + height.saturating_sub(1);
     buf.push_str(&format!(
-        "\x1b[{bot_r};{left_c}H\x1b[1;37;45m└{}┘\x1b[0m",
-        "─".repeat(inner_w)
+        "\x1b[{bottom};{left}H{ACCENT}╰{}╯{RESET}",
+        "─".repeat(inner)
     ));
 }
 
-fn send_prompt_turn(
-    state: &Arc<Mutex<TuiState>>,
-    cfg: &Config,
-    local_router: &ProviderRouter,
-    user_text: &str,
-) {
-    let (model, effort, agent, messages_snapshot) = {
+fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
+    if key == Key::CtrlC {
+        return Action::Quit;
+    }
+    match st.modal.clone() {
+        Modal::None => {}
+        Modal::Model { selected, filter } => {
+            let models = st.filtered_models(&filter);
+            let last = models.len().saturating_sub(1);
+            match key {
+                Key::Esc | Key::F2 => st.modal = Modal::None,
+                Key::Up => {
+                    st.modal = Modal::Model {
+                        selected: selected.saturating_sub(1),
+                        filter,
+                    }
+                }
+                Key::Down => {
+                    st.modal = Modal::Model {
+                        selected: (selected + 1).min(last),
+                        filter,
+                    }
+                }
+                Key::Backspace => {
+                    let mut f = filter;
+                    f.pop();
+                    st.modal = Modal::Model {
+                        selected: 0,
+                        filter: f,
+                    };
+                }
+                Key::Char(c) => {
+                    let mut f = filter;
+                    f.push(c);
+                    st.modal = Modal::Model {
+                        selected: 0,
+                        filter: f,
+                    };
+                }
+                Key::Enter => {
+                    if let Some((m, prov, _)) = models.get(selected.min(last)) {
+                        st.model = (*m).to_string();
+                        let eff = st.effort.clone();
+                        st.note(format!("Model set to {m} ({prov}, effort {eff})"));
+                    }
+                    st.modal = Modal::None;
+                }
+                _ => {}
+            }
+        }
+        Modal::Effort { selected } => match key {
+            Key::Esc | Key::F3 => st.modal = Modal::None,
+            Key::Up => {
+                st.modal = Modal::Effort {
+                    selected: selected.saturating_sub(1),
+                }
+            }
+            Key::Down => {
+                st.modal = Modal::Effort {
+                    selected: (selected + 1).min(EFFORT_LEVELS.len() - 1),
+                }
+            }
+            Key::Enter => {
+                st.effort = EFFORT_LEVELS[selected].to_string();
+                let eff = st.effort.clone();
+                st.note(format!("Reasoning effort set to {eff}"));
+                st.modal = Modal::None;
+            }
+            _ => {}
+        },
+        Modal::Agent { selected } => {
+            let entries = st.agent_entries();
+            let last = entries.len().saturating_sub(1);
+            match key {
+                Key::Esc | Key::F4 => st.modal = Modal::None,
+                Key::Up => {
+                    st.modal = Modal::Agent {
+                        selected: selected.saturating_sub(1),
+                    }
+                }
+                Key::Down => {
+                    st.modal = Modal::Agent {
+                        selected: (selected + 1).min(last),
+                    }
+                }
+                Key::Enter => {
+                    if let Some((name, eff, chain)) = entries.get(selected.min(last)) {
+                        if name == "none" {
+                            st.agent = None;
+                            st.note("Agent chain disabled, using direct model routing".to_string());
+                        } else {
+                            st.agent = Some(name.clone());
+                            st.effort = eff.clone();
+                            if let Some(first) = chain.first() {
+                                st.model = first.clone();
+                            }
+                            st.note(format!("Agent {name}: {}", chain.join(" -> ")));
+                        }
+                    }
+                    st.modal = Modal::None;
+                }
+                _ => {}
+            }
+        }
+    }
+    Action::None
+}
+
+fn handle_key(st: &mut TuiState, key: Key) -> Action {
+    st.notice.clear();
+    let sugg_len = st.suggestions().len();
+    match key {
+        Key::CtrlC => return Action::Quit,
+        Key::F2 | Key::CtrlN => {
+            st.modal = Modal::Model {
+                selected: 0,
+                filter: String::new(),
+            }
+        }
+        Key::F3 | Key::CtrlT => st.open_effort(),
+        Key::F4 | Key::CtrlG => st.modal = Modal::Agent { selected: 0 },
+        Key::F5 => return Action::Command("/status".to_string()),
+        Key::CtrlR => return Action::Command("/reset".to_string()),
+        Key::CtrlL => return Action::Command("/clear".to_string()),
+        Key::PageUp => st.scroll = st.scroll.saturating_add(8),
+        Key::PageDown => st.scroll = st.scroll.saturating_sub(8),
+        Key::Left => st.cursor = st.cursor.saturating_sub(1),
+        Key::Right => st.cursor = (st.cursor + 1).min(st.input.len()),
+        Key::Home => st.cursor = 0,
+        Key::End => st.cursor = st.input.len(),
+        Key::Backspace => {
+            if st.cursor > 0 {
+                st.input.remove(st.cursor - 1);
+                st.cursor -= 1;
+                st.sugg_sel = 0;
+            }
+        }
+        Key::Delete => {
+            if st.cursor < st.input.len() {
+                st.input.remove(st.cursor);
+            }
+        }
+        Key::CtrlU | Key::Esc => {
+            st.input.clear();
+            st.cursor = 0;
+            st.sugg_sel = 0;
+        }
+        Key::Tab => {
+            if sugg_len > 0 {
+                let cmd = st.suggestions()[st.sugg_sel.min(sugg_len - 1)].0;
+                st.input = format!("{cmd} ").chars().collect();
+                st.cursor = st.input.len();
+                st.sugg_sel = 0;
+            }
+        }
+        Key::Up => {
+            if sugg_len > 0 {
+                st.sugg_sel = if st.sugg_sel == 0 {
+                    sugg_len - 1
+                } else {
+                    st.sugg_sel - 1
+                };
+            } else if !st.prompts.is_empty() {
+                let idx = match st.prompt_idx {
+                    None => st.prompts.len() - 1,
+                    Some(i) => i.saturating_sub(1),
+                };
+                st.prompt_idx = Some(idx);
+                st.input = st.prompts[idx].chars().collect();
+                st.cursor = st.input.len();
+            }
+        }
+        Key::Down => {
+            if sugg_len > 0 {
+                st.sugg_sel = (st.sugg_sel + 1) % sugg_len;
+            } else if let Some(i) = st.prompt_idx {
+                if i + 1 < st.prompts.len() {
+                    st.prompt_idx = Some(i + 1);
+                    st.input = st.prompts[i + 1].chars().collect();
+                    st.cursor = st.input.len();
+                } else {
+                    st.prompt_idx = None;
+                    st.input.clear();
+                    st.cursor = 0;
+                }
+            }
+        }
+        Key::Char(c) => {
+            st.input.insert(st.cursor, c);
+            st.cursor += 1;
+            st.sugg_sel = 0;
+            st.prompt_idx = None;
+            st.scroll = 0;
+        }
+        Key::Enter => {
+            let sugg = st.suggestions();
+            let mut text: String = st.input.iter().collect();
+            if !sugg.is_empty() {
+                text = sugg[st.sugg_sel.min(sugg.len() - 1)].0.to_string();
+            }
+            let text = text.trim().to_string();
+            st.input.clear();
+            st.cursor = 0;
+            st.sugg_sel = 0;
+            st.prompt_idx = None;
+            st.scroll = 0;
+            if text.is_empty() {
+                return Action::None;
+            }
+            if text.starts_with('/') {
+                return Action::Command(text);
+            }
+            if st.busy {
+                st.notice = "Still generating, wait for the current response".to_string();
+                st.input = text.chars().collect();
+                st.cursor = st.input.len();
+                return Action::None;
+            }
+            st.prompts.push(text.clone());
+            return Action::Submit(text);
+        }
+        Key::Unknown => {}
+    }
+    Action::None
+}
+
+fn status_text(router: &ProviderRouter) -> String {
+    let status = router.status();
+    let mut out = String::new();
+    if let Some(provs) = status.get("providers").and_then(|v| v.as_obj()) {
+        for (name, info) in provs {
+            let avail = info
+                .get("available")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let calls = info.get("calls").and_then(|v| v.as_i64()).unwrap_or(0);
+            if avail {
+                out.push_str(&format!("{name:<7} available, {calls} calls\n"));
+            } else {
+                let rem = info
+                    .get("cooldown_remaining_sec")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let err = info
+                    .get("last_limit_error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                out.push_str(&format!("{name:<7} limited, retry in {rem}s: {err}\n"));
+            }
+        }
+    }
+    out.trim_end().to_string()
+}
+
+fn start_turn(state: &Arc<Mutex<TuiState>>, router: &Arc<ProviderRouter>, text: String) {
+    let (model, effort, agent, snapshot, idx) = {
         let mut st = state.lock().unwrap();
-        st.scroll_offset = 0;
-        st.transcript.push(ChatEntry {
-            role: "user".to_string(),
-            header: String::new(),
-            text: user_text.to_string(),
-        });
         st.history.push(Json::obj(vec![
             ("role", Json::Str("user".to_string())),
-            ("content", Json::Str(user_text.to_string())),
+            ("content", Json::Str(text.clone())),
         ]));
-        let hdr = format!("{} | effort={}", st.model, st.effort);
-        st.transcript.push(ChatEntry {
-            role: "assistant".to_string(),
-            header: hdr,
-            text: "…".to_string(),
+        st.entries.push(Entry {
+            kind: Kind::User,
+            text,
+            meta: String::new(),
         });
-        st.status_note = format!("Generating via {} (effort={})...", st.model, st.effort);
-        st.render(cfg);
+        st.entries.push(Entry {
+            kind: Kind::Assistant,
+            text: String::new(),
+            meta: String::new(),
+        });
+        st.busy = true;
+        st.busy_since = Instant::now();
+        st.stream_chars = 0;
+        st.scroll = 0;
+        if let Ok(mut p) = PROGRESS.lock() {
+            p.clear();
+        }
+        st.render();
         (
             st.model.clone(),
             st.effort.clone(),
             st.agent.clone(),
             st.history.clone(),
+            st.entries.len() - 1,
         )
     };
-
-    let state_cb = Arc::clone(state);
-    let mut accumulated = String::new();
-    let res = {
-        let mut on_delta = |chunk: &str| {
-            accumulated.push_str(chunk);
-            if let Ok(mut st) = state_cb.lock() {
-                if let Some(last) = st.transcript.last_mut() {
-                    last.text = accumulated.clone();
+    let state_t = Arc::clone(state);
+    let router_t = Arc::clone(router);
+    thread::spawn(move || {
+        let started = Instant::now();
+        let mut acc = String::new();
+        let res = {
+            let state_cb = Arc::clone(&state_t);
+            let mut on_delta = |chunk: &str| {
+                acc.push_str(chunk);
+                if let Ok(mut st) = state_cb.lock() {
+                    st.stream_chars = acc.chars().count();
+                    if let Some(entry) = st.entries.get_mut(idx) {
+                        entry.text = acc.clone();
+                    }
+                    st.dirty = true;
                 }
-                st.render(cfg);
-            }
+            };
+            let mut cb: Option<&mut dyn FnMut(&str)> = Some(&mut on_delta);
+            router_t.execute_turn(&snapshot, None, &model, effort, agent.as_deref(), &mut cb)
         };
-        let mut cb_opt: Option<&mut dyn FnMut(&str)> = Some(&mut on_delta);
-
-        local_router.execute_turn(
-            &messages_snapshot,
-            None,
-            &model,
-            effort.clone(),
-            agent.as_deref(),
-            &mut cb_opt,
-        )
-    };
-
-    let mut st = state.lock().unwrap();
-    match res {
-        Ok((final_text, _usage, resolved_model, used_provider)) => {
-            if let Some(last) = st.transcript.last_mut() {
-                last.header = format!("{resolved_model} via {used_provider}");
-                last.text = if final_text.is_empty() {
-                    accumulated
+        let mut st = state_t.lock().unwrap();
+        st.busy = false;
+        let secs = started.elapsed().as_secs_f32();
+        match res {
+            Ok((final_text, _usage, resolved, provider)) => {
+                let text = if final_text.is_empty() {
+                    acc
                 } else {
-                    final_text.clone()
+                    final_text
                 };
+                if let Some(entry) = st.entries.get_mut(idx) {
+                    entry.text = text.clone();
+                    entry.meta = format!("{resolved} via {provider} in {secs:.1}s");
+                }
+                st.history.push(Json::obj(vec![
+                    ("role", Json::Str("assistant".to_string())),
+                    ("content", Json::Str(text)),
+                ]));
             }
-            st.history.push(Json::obj(vec![
-                ("role", Json::Str("assistant".to_string())),
-                ("content", Json::Str(final_text)),
-            ]));
-            st.status_note = format!("Completed ({resolved_model} via {used_provider})");
-        }
-        Err(err) => {
-            if let Some(last) = st.transcript.last_mut() {
-                last.header = "error".to_string();
-                last.text = format!("Error: {err}");
+            Err(err) => {
+                if let Some(entry) = st.entries.get_mut(idx) {
+                    entry.kind = Kind::Error;
+                    entry.text = err;
+                }
             }
-            st.status_note = "Turn failed".to_string();
         }
-    }
-    st.refresh_provider_badges(cfg, local_router);
-    st.render(cfg);
+        st.refresh_badges(&router_t);
+        st.render();
+    });
 }
 
-fn handle_slash_command(
-    cmd_line: &str,
+fn run_command(
     state: &Arc<Mutex<TuiState>>,
+    router: &Arc<ProviderRouter>,
     cfg: &Config,
-    local_router: &ProviderRouter,
+    line: &str,
 ) -> bool {
-    let parts: Vec<&str> = cmd_line.split_whitespace().collect();
+    let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.is_empty() {
         return false;
     }
     let mut st = state.lock().unwrap();
     match parts[0] {
         "/quit" | "/exit" | "/q" => return true,
+        "/help" | "/?" => st.note(HELP_TEXT.to_string()),
         "/clear" | "/new" => {
-            st.history.clear();
-            st.transcript.clear();
-            st.scroll_offset = 0;
-            st.status_note = "Conversation cleared".to_string();
+            if st.busy {
+                st.notice = "Wait for the current response before clearing".to_string();
+            } else {
+                st.history.clear();
+                st.entries.clear();
+                st.scroll = 0;
+                st.force_clear = true;
+                st.notice = "Conversation cleared".to_string();
+            }
         }
         "/model" | "/m" => {
             if parts.len() == 1 {
-                st.modal = Modal::ModelPicker {
+                st.modal = Modal::Model {
                     selected: 0,
                     filter: String::new(),
                 };
@@ -675,118 +1299,114 @@ fn handle_slash_command(
                 st.model = parts[1].to_string();
                 let mut i = 2;
                 while i < parts.len() {
-                    if matches!(parts[i], "--reasoning" | "--effort" | "-e") && i + 1 < parts.len()
-                    {
-                        st.effort = parts[i + 1].to_lowercase();
+                    let is_flag = matches!(parts[i], "--reasoning" | "--effort" | "-e");
+                    if is_flag && i + 1 < parts.len() {
+                        let lvl = parts[i + 1].to_lowercase();
+                        if EFFORT_LEVELS.contains(&lvl.as_str()) {
+                            st.effort = lvl;
+                        }
                         i += 2;
                     } else {
                         i += 1;
                     }
                 }
-                st.status_note = format!("Switched model to {} (effort={})", st.model, st.effort);
+                let (model, eff) = (st.model.clone(), st.effort.clone());
+                st.note(format!("Model set to {model} (effort {eff})"));
             }
         }
         "/effort" | "/reasoning" | "/level" => {
             if parts.len() == 1 {
-                let idx = EFFORT_LEVELS
-                    .iter()
-                    .position(|e| *e == st.effort)
-                    .unwrap_or(1);
-                st.modal = Modal::EffortPicker { selected: idx };
+                st.open_effort();
             } else {
                 let lvl = parts[1].to_lowercase();
                 if EFFORT_LEVELS.contains(&lvl.as_str()) {
-                    st.effort = lvl;
-                    st.status_note = format!("Reasoning effort set to {}", st.effort);
+                    st.effort = lvl.clone();
+                    st.note(format!("Reasoning effort set to {lvl}"));
                 } else {
-                    st.status_note =
-                        "Invalid effort level (choose: low, medium, high, xhigh, max)".to_string();
+                    st.notice = "Effort must be one of low, medium, high, xhigh, max".to_string();
                 }
             }
         }
-        "/agent" | "/a" => {
-            if parts.len() == 1 {
-                st.modal = Modal::AgentPicker { selected: 0 };
-            } else if parts[1] == "set" && parts.len() >= 4 {
-                let ag_name = parts[2];
-                let mut models = Vec::new();
-                let mut eff_ov: Option<&str> = None;
-                let mut i = 3;
-                while i < parts.len() {
-                    if matches!(parts[i], "--effort" | "--reasoning" | "-e") && i + 1 < parts.len()
-                    {
-                        eff_ov = Some(parts[i + 1]);
-                        i += 2;
-                    } else {
-                        models.push(parts[i].to_string());
-                        i += 1;
-                    }
-                }
-                if local_router
-                    .set_agent_chain(ag_name, &models, eff_ov)
-                    .is_ok()
-                {
-                    st.agent = Some(ag_name.to_string());
-                    if let Some(first) = models.first() {
-                        st.model = first.clone();
-                    }
-                    if let Some(e) = eff_ov {
-                        st.effort = e.to_lowercase();
-                    }
-                    st.status_note =
-                        format!("Updated agent '{}' chain: {}", ag_name, models.join(" -> "));
-                }
-            } else if matches!(parts[1], "none" | "off" | "reset") {
-                st.agent = None;
-                st.status_note = "Agent override disabled".to_string();
-            } else {
-                let target = parts[1].to_lowercase();
-                let entries = st.agent_entries(cfg);
-                if let Some((_, eff, chain)) = entries.into_iter().find(|(n, _, _)| *n == target) {
-                    st.agent = Some(target.clone());
-                    st.effort = eff;
-                    if let Some(first) = chain.first() {
-                        st.model = first.clone();
-                    }
-                    st.status_note = format!("Active agent switched to '{target}'");
-                } else {
-                    st.agent = Some(target.clone());
-                    st.status_note = format!("Active agent set to '{target}'");
-                }
-            }
-        }
+        "/agent" | "/a" => agent_command(&mut st, router, &parts),
         "/reset" => {
             let prov = parts.get(1).copied();
-            local_router.reset_cooldown(prov);
+            router.reset_cooldown(prov);
             let body = Json::obj(vec![(
                 "provider",
                 prov.map(|s| Json::Str(s.to_string())).unwrap_or(Json::Null),
             )]);
             let _ = http_call(&cfg.host, cfg.port, "POST", "/v1/router/reset", Some(&body));
-            st.refresh_provider_badges(cfg, local_router);
-            st.status_note = "Provider rate-limit cooldowns reset".to_string();
+            st.refresh_badges(router);
+            st.note("Rate-limit cooldowns cleared".to_string());
         }
         "/status" => {
-            st.refresh_provider_badges(cfg, local_router);
-            let status_json = http_call(&cfg.host, cfg.port, "GET", "/v1/router/status", None)
-                .unwrap_or_else(|_| local_router.status());
-            st.transcript.push(ChatEntry {
-                role: "system".to_string(),
-                header: "router status".to_string(),
-                text: status_json.dump_pretty(),
-            });
-            st.scroll_offset = 0;
-            st.status_note = "Displayed live router status".to_string();
+            st.refresh_badges(router);
+            st.note(status_text(router));
         }
-        _ => {
-            st.status_note = format!(
-                "Unknown command '{}'. Try /model, /effort, /agent, /status, /reset, /clear, /quit",
-                parts[0]
-            );
+        other => {
+            st.notice = format!("Unknown command {other}, try /help");
         }
     }
-    st.render(cfg);
+    st.render();
     false
+}
+
+fn agent_command(st: &mut TuiState, router: &Arc<ProviderRouter>, parts: &[&str]) {
+    if parts.len() == 1 {
+        st.modal = Modal::Agent { selected: 0 };
+        return;
+    }
+    if parts[1] == "set" && parts.len() >= 4 {
+        let name = parts[2];
+        let mut models = Vec::new();
+        let mut eff_override: Option<&str> = None;
+        let mut i = 3;
+        while i < parts.len() {
+            let is_flag = matches!(parts[i], "--effort" | "--reasoning" | "-e");
+            if is_flag && i + 1 < parts.len() {
+                eff_override = Some(parts[i + 1]);
+                i += 2;
+            } else {
+                models.push(parts[i].to_string());
+                i += 1;
+            }
+        }
+        match router.set_agent_chain(name, &models, eff_override) {
+            Ok(_) => {
+                st.agent = Some(name.to_string());
+                if let Some(first) = models.first() {
+                    st.model = first.clone();
+                }
+                if let Some(e) = eff_override {
+                    st.effort = e.to_lowercase();
+                }
+                st.note(format!("Agent {name}: {}", models.join(" -> ")));
+            }
+            Err(e) => st.notice = format!("Could not save agent chain: {e}"),
+        }
+        return;
+    }
+    if matches!(parts[1], "none" | "off" | "reset") {
+        st.agent = None;
+        st.note("Agent chain disabled, using direct model routing".to_string());
+        return;
+    }
+    let target = parts[1].to_lowercase();
+    let found = st
+        .agent_entries()
+        .into_iter()
+        .find(|(n, _, _)| *n == target);
+    match found {
+        Some((_, eff, chain)) => {
+            st.agent = Some(target.clone());
+            st.effort = eff;
+            if let Some(first) = chain.first() {
+                st.model = first.clone();
+            }
+            st.note(format!("Agent {target}: {}", chain.join(" -> ")));
+        }
+        None => st.notice = format!("No agent named {target} in {}", st.routes_path),
+    }
 }
 
 pub fn run_tui(
@@ -797,12 +1417,13 @@ pub fn run_tui(
     initial_effort: Option<String>,
 ) {
     let _guard = RawTermGuard::enter();
+    let rx = spawn_input_thread();
     let state = Arc::new(Mutex::new(TuiState::new(&cfg)));
     {
         let mut st = state.lock().unwrap();
         if let Some(ag) = initial_agent {
-            let entries = st.agent_entries(&cfg);
-            if let Some((_, eff, chain)) = entries.into_iter().find(|(n, _, _)| *n == ag) {
+            let found = st.agent_entries().into_iter().find(|(n, _, _)| *n == ag);
+            if let Some((_, eff, chain)) = found {
                 st.effort = eff;
                 if let Some(first) = chain.first() {
                     st.model = first.clone();
@@ -816,192 +1437,44 @@ pub fn run_tui(
         if let Some(e) = initial_effort {
             st.effort = e;
         }
-        st.refresh_provider_badges(&cfg, &router);
-        st.render(&cfg);
+        st.refresh_badges(&router);
+        st.render();
     }
 
-    let mut stdin = io::stdin();
-    while let Ok(key) = read_key(&mut stdin) {
-        let mut pending_turn: Option<String> = None;
-        let mut pending_cmd: Option<String> = None;
-
-        {
+    loop {
+        let key = next_key(&rx, Duration::from_millis(90));
+        let action = {
             let mut st = state.lock().unwrap();
-            match st.modal.clone() {
-                Modal::ModelPicker {
-                    mut selected,
-                    mut filter,
-                } => {
-                    let models = st.filtered_models(&filter);
-                    match key {
-                        Key::Esc | Key::F2 => st.modal = Modal::None,
-                        Key::CtrlC => break,
-                        Key::Up => {
-                            selected = selected.saturating_sub(1);
-                            st.modal = Modal::ModelPicker { selected, filter };
-                        }
-                        Key::Down => {
-                            if !models.is_empty() {
-                                selected = (selected + 1).min(models.len() - 1);
-                            }
-                            st.modal = Modal::ModelPicker { selected, filter };
-                        }
-                        Key::Backspace => {
-                            filter.pop();
-                            selected = 0;
-                            st.modal = Modal::ModelPicker { selected, filter };
-                        }
-                        Key::Char(ch) => {
-                            filter.push(ch);
-                            selected = 0;
-                            st.modal = Modal::ModelPicker { selected, filter };
-                        }
-                        Key::Enter => {
-                            if let Some((m, prov, _)) = models.get(selected) {
-                                st.model = (*m).to_string();
-                                st.status_note =
-                                    format!("Selected model: {prov}/{m} (effort={})", st.effort);
-                            }
-                            st.modal = Modal::None;
-                        }
-                        _ => {}
-                    }
-                    st.render(&cfg);
-                    continue;
-                }
-                Modal::EffortPicker { mut selected } => {
-                    match key {
-                        Key::Esc | Key::F3 => st.modal = Modal::None,
-                        Key::CtrlC => break,
-                        Key::Up => {
-                            selected = selected.saturating_sub(1);
-                            st.modal = Modal::EffortPicker { selected };
-                        }
-                        Key::Down => {
-                            selected = (selected + 1).min(EFFORT_LEVELS.len() - 1);
-                            st.modal = Modal::EffortPicker { selected };
-                        }
-                        Key::Enter => {
-                            st.effort = EFFORT_LEVELS[selected].to_string();
-                            st.status_note = format!("Reasoning effort set to '{}'", st.effort);
-                            st.modal = Modal::None;
-                        }
-                        _ => {}
-                    }
-                    st.render(&cfg);
-                    continue;
-                }
-                Modal::AgentPicker { mut selected } => {
-                    let entries = st.agent_entries(&cfg);
-                    match key {
-                        Key::Esc | Key::F4 => st.modal = Modal::None,
-                        Key::CtrlC => break,
-                        Key::Up => {
-                            selected = selected.saturating_sub(1);
-                            st.modal = Modal::AgentPicker { selected };
-                        }
-                        Key::Down => {
-                            if !entries.is_empty() {
-                                selected = (selected + 1).min(entries.len() - 1);
-                            }
-                            st.modal = Modal::AgentPicker { selected };
-                        }
-                        Key::Enter => {
-                            if let Some((name, eff, chain)) = entries.get(selected) {
-                                if name == "none" {
-                                    st.agent = None;
-                                    st.status_note =
-                                        "Agent chain disabled (direct model routing)".to_string();
-                                } else {
-                                    st.agent = Some(name.clone());
-                                    st.effort = eff.clone();
-                                    if let Some(first) = chain.first() {
-                                        st.model = first.clone();
-                                    }
-                                    st.status_note =
-                                        format!("Active agent: {} ({})", name, chain.join(" -> "));
-                                }
-                            }
-                            st.modal = Modal::None;
-                        }
-                        _ => {}
-                    }
-                    st.render(&cfg);
-                    continue;
-                }
-                Modal::None => {}
-            }
-
             match key {
-                Key::CtrlC => break,
-                Key::F2 | Key::CtrlM => {
-                    st.modal = Modal::ModelPicker {
-                        selected: 0,
-                        filter: String::new(),
-                    };
-                }
-                Key::F3 | Key::CtrlE => {
-                    let idx = EFFORT_LEVELS
-                        .iter()
-                        .position(|e| *e == st.effort)
-                        .unwrap_or(1);
-                    st.modal = Modal::EffortPicker { selected: idx };
-                }
-                Key::F4 | Key::CtrlA => {
-                    st.modal = Modal::AgentPicker { selected: 0 };
-                }
-                Key::F5 => {
-                    pending_cmd = Some("/status".to_string());
-                }
-                Key::CtrlR => {
-                    pending_cmd = Some("/reset".to_string());
-                }
-                Key::CtrlL => {
-                    pending_cmd = Some("/clear".to_string());
-                }
-                Key::Up => {
-                    st.scroll_offset = st.scroll_offset.saturating_add(1);
-                }
-                Key::Down => {
-                    st.scroll_offset = st.scroll_offset.saturating_sub(1);
-                }
-                Key::PageUp => {
-                    st.scroll_offset = st.scroll_offset.saturating_add(8);
-                }
-                Key::PageDown => {
-                    st.scroll_offset = st.scroll_offset.saturating_sub(8);
-                }
-                Key::Backspace => {
-                    st.input.pop();
-                }
-                Key::Esc => {
-                    st.input.clear();
-                }
-                Key::Char(ch) => {
-                    st.input.push(ch);
-                }
-                Key::Enter => {
-                    let trimmed = st.input.trim().to_string();
-                    st.input.clear();
-                    if !trimmed.is_empty() {
-                        if trimmed.starts_with('/') {
-                            pending_cmd = Some(trimmed);
-                        } else {
-                            pending_turn = Some(trimmed);
-                        }
+                None => {
+                    st.tick = st.tick.wrapping_add(1);
+                    let resized = st.poll_size();
+                    if st.busy || st.dirty || resized {
+                        st.dirty = false;
+                        st.render();
                     }
+                    continue;
                 }
-                Key::Unknown => {}
+                Some(k) => {
+                    let act = if st.modal == Modal::None {
+                        handle_key(&mut st, k)
+                    } else {
+                        handle_modal_key(&mut st, k)
+                    };
+                    st.render();
+                    act
+                }
             }
-            st.render(&cfg);
-        }
-
-        if let Some(cmd) = pending_cmd {
-            if handle_slash_command(&cmd, &state, &cfg, &router) {
-                break;
+        };
+        match action {
+            Action::None => {}
+            Action::Quit => break,
+            Action::Submit(text) => start_turn(&state, &router, text),
+            Action::Command(line) => {
+                if run_command(&state, &router, &cfg, &line) {
+                    break;
+                }
             }
-        } else if let Some(prompt_text) = pending_turn {
-            send_prompt_turn(&state, &cfg, &router, &prompt_text);
         }
     }
 }
