@@ -2747,12 +2747,19 @@ fn build_local_router(cfg: &Config) -> Arc<ProviderRouter> {
     Arc::new(ProviderRouter::new(cfg.clone(), sticky))
 }
 
-fn parse_cli_run_flags(
-    args: &[String],
-) -> (Option<String>, Option<String>, Option<String>, String) {
+struct CliRunFlags {
+    agent: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+    resume: Option<String>,
+    prompt: String,
+}
+
+fn parse_cli_run_flags(args: &[String]) -> CliRunFlags {
     let mut agent = None;
     let mut model = None;
     let mut effort = None;
+    let mut resume = None;
     let mut prompt_parts = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -2769,20 +2776,40 @@ fn parse_cli_run_flags(
                 effort = Some(args[i + 1].clone());
                 i += 2;
             }
+            "-c" | "--continue" => {
+                resume = Some("latest".to_string());
+                i += 1;
+            }
+            "-r" | "--resume" => {
+                if i + 1 < args.len() && !args[i + 1].starts_with('-') {
+                    resume = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    resume = Some("picker".to_string());
+                    i += 1;
+                }
+            }
             other => {
                 prompt_parts.push(other.to_string());
                 i += 1;
             }
         }
     }
-    (agent, model, effort, prompt_parts.join(" "))
+    CliRunFlags {
+        agent,
+        model,
+        effort,
+        resume,
+        prompt: prompt_parts.join(" "),
+    }
 }
 
 fn print_help() {
     println!(
         "cligate — OpenAI-Compatible CLI-OAuth Gateway, TUI & Per-Agent Fallback Router\n\n\
          Commands:\n  \
-         cligate tui [-a <agent>] [-m <model>] [-e <level>]   Launch interactive Terminal UI (TUI)\n  \
+         cligate [-c|--continue] [-r|--resume [id]] [-a <agent>] [-m <model>] [-e <level>]\n  \
+         cligate tui [-c] [-r [id]] [-a <agent>] [-m <model>] [-e <level>]\n  \
          cligate ask [-a <agent>] [-m <model>] [-e <level>] <prompt>\n  \
          cligate serve [--host 127.0.0.1] [--port 8787]       Start OpenAI HTTP gateway server\n  \
          cligate status                                       Show live router health, cooldowns & cache\n  \
@@ -2798,22 +2825,44 @@ fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() {
         let router = build_local_router(&cfg);
-        tui::run_tui(cfg, router, None, None, None);
+        tui::run_tui(cfg, router, None, None, None, None);
         return;
     }
     if matches!(args[0].as_str(), "-h" | "--help" | "help") {
         print_help();
         return;
     }
+    if args[0].starts_with('-') {
+        let flags = parse_cli_run_flags(&args);
+        let router = build_local_router(&cfg);
+        tui::run_tui(
+            cfg,
+            router,
+            flags.agent,
+            flags.model,
+            flags.effort,
+            flags.resume,
+        );
+        return;
+    }
 
     match args[0].as_str() {
         "tui" | "chat" => {
-            let (agent, model, effort, _) = parse_cli_run_flags(&args[1..]);
+            let flags = parse_cli_run_flags(&args[1..]);
             let router = build_local_router(&cfg);
-            tui::run_tui(cfg, router, agent, model, effort);
+            tui::run_tui(
+                cfg,
+                router,
+                flags.agent,
+                flags.model,
+                flags.effort,
+                flags.resume,
+            );
         }
         "ask" | "run" => {
-            let (agent, model, effort, prompt) = parse_cli_run_flags(&args[1..]);
+            let flags = parse_cli_run_flags(&args[1..]);
+            let (agent, model, effort, prompt) =
+                (flags.agent, flags.model, flags.effort, flags.prompt);
             if prompt.trim().is_empty() {
                 eprintln!("Usage: cligate ask [-a <agent>] [-m <model>] [-e <effort>] <prompt>");
                 std::process::exit(1);

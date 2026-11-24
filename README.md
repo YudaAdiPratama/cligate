@@ -223,7 +223,9 @@ print(response.choices[0].message.content)
 `cligate` includes a built-in full-screen ANSI Terminal User Interface with interactive modal pickers for models, reasoning effort levels, and per-agent fallback chains:
 
 ```bash
-cligate tui
+cligate
+cligate --continue
+cligate --resume <session_id>
 cligate tui --agent coder --effort high
 cligate tui --model gemini-4-neon --effort xhigh
 ```
@@ -232,10 +234,12 @@ Inside the TUI:
 - `F2` or `/model`: Open interactive **Model Picker** (filter & select across all 36 native `claude`, `codex`, and `agy` models).
 - `F3` or `/effort`: Open interactive **Reasoning Effort Level Picker** (`low`, `medium`, `high`, `xhigh`, `max`).
 - `F4` or `/agent`: Open interactive **Agent Fallback Chain Picker** (or type `/agent set <name> <m1> <m2> <m3> --effort <level>`).
+- `/resume`: Open interactive **Session Picker** to resume any saved conversation (or `/resume <id>`).
+- `/new`: Start a fresh session while keeping the previous one saved.
 - `F5` or `/status`: Display live provider health, cooldown timers, and sticky cache metrics.
 - `/reset`: Clear all 429 rate-limit cooldowns.
 - `/clear`: Clear conversation transcript.
-- `Ctrl+C` or `/quit`: Exit the TUI cleanly.
+- `Esc` or `Ctrl+C`: Interrupt active generation; `Ctrl+C` (when idle) or `/quit` exits and prints the session ID for resuming.
 
 ### Run a One-Shot Prompt from the Terminal (`cligate ask`)
 ```bash

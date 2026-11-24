@@ -1,9 +1,11 @@
-use crate::json::Json;
+use crate::json::{parse_json, Json};
 use crate::{
-    all_known_models, http_call, infer_provider_and_model, load_agent_routes, request_cancel,
-    reset_cancel, Config, ProviderRouter, PROGRESS,
+    all_known_models, gen_hex_id, home_dir, http_call, infer_provider_and_model, load_agent_routes,
+    now_sec, request_cancel, reset_cancel, Config, ProviderRouter, PROGRESS,
 };
+use std::fs;
 use std::io::{self, Read, Write};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
@@ -25,13 +27,15 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/model", "Switch model"),
     ("/effort", "Set reasoning effort level"),
     ("/agent", "Switch agent fallback chain"),
+    ("/resume", "Resume a previous session"),
+    ("/new", "Start a new session"),
     ("/status", "Show provider health and cooldowns"),
     ("/reset", "Clear rate-limit cooldowns"),
     ("/clear", "Clear the conversation"),
     ("/help", "Show shortcuts"),
     ("/quit", "Exit cligate"),
 ];
-const HELP_TEXT: &str = "Shortcuts\n  /model   F2 / ctrl+n   switch model\n  /effort  F3 / ctrl+t   reasoning effort\n  /agent   F4 / ctrl+g   agent fallback chain\n  /status  F5            provider health\n  /reset   ctrl+r        clear rate-limit cooldowns\n  /clear   ctrl+l        clear conversation\n  PgUp/PgDn scroll, up/down prompt history, tab complete, ctrl+u clear line, ctrl+c quit";
+const HELP_TEXT: &str = "Shortcuts\n  /model   F2 / ctrl+n   switch model\n  /effort  F3 / ctrl+t   reasoning effort\n  /agent   F4 / ctrl+g   agent fallback chain\n  /resume                resume a saved session\n  /new                   start a fresh session\n  /status  F5            provider health\n  /reset   ctrl+r        clear rate-limit cooldowns\n  /clear   ctrl+l        clear conversation\n  scroll: mouse wheel, shift+up/down, PgUp/PgDn | stop: esc or ctrl+c | quit: ctrl+c";
 
 struct RawTermGuard {
     saved_state: Option<String>,
@@ -420,6 +424,81 @@ enum Modal {
     Model { selected: usize, filter: String },
     Effort { selected: usize },
     Agent { selected: usize },
+    Session { selected: usize },
+}
+
+#[derive(Clone)]
+pub struct SessionSummary {
+    pub id: String,
+    pub title: String,
+    pub model: String,
+    pub updated_at: u64,
+}
+
+fn sessions_dir() -> PathBuf {
+    if let Ok(v) = std::env::var("CLIGATE_SESSIONS_DIR") {
+        if !v.trim().is_empty() {
+            return PathBuf::from(v);
+        }
+    }
+    home_dir()
+        .join(".local")
+        .join("share")
+        .join("cligate")
+        .join("sessions")
+}
+
+fn new_session_id() -> String {
+    let raw = gen_hex_id("");
+    let short: String = raw.chars().rev().take(8).collect();
+    format!("ses_{short}")
+}
+
+pub fn list_saved_sessions() -> Vec<SessionSummary> {
+    let dir = sessions_dir();
+    let Ok(rd) = fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(doc) = parse_json(&raw) else {
+            continue;
+        };
+        let id = doc
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if id.is_empty() {
+            continue;
+        }
+        let title = doc
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(untitled)")
+            .to_string();
+        let model = doc
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let updated_at = doc.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0) as u64;
+        out.push(SessionSummary {
+            id,
+            title,
+            model,
+            updated_at,
+        });
+    }
+    out.sort_by_key(|a| std::cmp::Reverse(a.updated_at));
+    out
 }
 
 enum Action {
@@ -432,6 +511,7 @@ enum Action {
 type ModelRow = (&'static str, &'static str, &'static [&'static str]);
 
 struct TuiState {
+    session_id: String,
     model: String,
     effort: String,
     agent: Option<String>,
@@ -461,6 +541,7 @@ struct TuiState {
 impl TuiState {
     fn new(cfg: &Config) -> Self {
         Self {
+            session_id: new_session_id(),
             model: cfg.default_model.clone(),
             effort: "medium".to_string(),
             agent: None,
@@ -495,6 +576,131 @@ impl TuiState {
             meta: String::new(),
         });
         self.scroll = 0;
+    }
+
+    fn save_session(&self) {
+        if self.history.is_empty() {
+            return;
+        }
+        let dir = sessions_dir();
+        let _ = fs::create_dir_all(&dir);
+        let title = self
+            .entries
+            .iter()
+            .find(|e| e.kind == Kind::User)
+            .map(|e| clip(&e.text.replace('\n', " "), 60))
+            .unwrap_or_else(|| "session".to_string());
+        let entries_json: Vec<Json> = self
+            .entries
+            .iter()
+            .map(|e| {
+                let kind_str = match e.kind {
+                    Kind::User => "user",
+                    Kind::Assistant => "assistant",
+                    Kind::Note => "note",
+                    Kind::Error => "error",
+                };
+                Json::obj(vec![
+                    ("kind", Json::Str(kind_str.to_string())),
+                    ("text", Json::Str(e.text.clone())),
+                    ("meta", Json::Str(e.meta.clone())),
+                ])
+            })
+            .collect();
+        let doc = Json::obj(vec![
+            ("id", Json::Str(self.session_id.clone())),
+            ("title", Json::Str(title)),
+            ("cwd", Json::Str(self.cwd.clone())),
+            ("model", Json::Str(self.model.clone())),
+            ("effort", Json::Str(self.effort.clone())),
+            (
+                "agent",
+                self.agent
+                    .as_ref()
+                    .map(|a| Json::Str(a.clone()))
+                    .unwrap_or(Json::Null),
+            ),
+            ("updated_at", Json::Num(now_sec() as f64)),
+            ("history", Json::Arr(self.history.clone())),
+            ("entries", Json::Arr(entries_json)),
+        ]);
+        let target = dir.join(format!("{}.json", self.session_id));
+        let tmp = dir.join(format!("{}.json.tmp", self.session_id));
+        if fs::write(&tmp, format!("{}\n", doc.dump_pretty())).is_ok() {
+            let _ = fs::rename(&tmp, &target);
+        }
+    }
+
+    fn load_session(&mut self, query: &str) -> Result<String, String> {
+        let sessions = list_saved_sessions();
+        let target_id = if query == "latest" {
+            sessions
+                .first()
+                .map(|s| s.id.clone())
+                .ok_or_else(|| "No saved sessions found".to_string())?
+        } else {
+            sessions
+                .iter()
+                .find(|s| s.id == query || s.id.starts_with(query))
+                .map(|s| s.id.clone())
+                .ok_or_else(|| format!("Session '{query}' not found"))?
+        };
+        let path = sessions_dir().join(format!("{target_id}.json"));
+        let raw = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let doc = parse_json(&raw)?;
+        self.session_id = target_id.clone();
+        if let Some(m) = doc.get("model").and_then(|v| v.as_str()) {
+            if !m.is_empty() {
+                self.model = m.to_string();
+            }
+        }
+        if let Some(e) = doc.get("effort").and_then(|v| v.as_str()) {
+            if !e.is_empty() {
+                self.effort = e.to_string();
+            }
+        }
+        self.agent = doc
+            .get("agent")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        self.history = doc
+            .get("history")
+            .and_then(|v| v.as_arr())
+            .map(|a| a.to_vec())
+            .unwrap_or_default();
+        self.entries = doc
+            .get("entries")
+            .and_then(|v| v.as_arr())
+            .map(|arr| {
+                arr.iter()
+                    .map(|item| {
+                        let kind = match item.get("kind").and_then(|v| v.as_str()) {
+                            Some("user") => Kind::User,
+                            Some("assistant") => Kind::Assistant,
+                            Some("error") => Kind::Error,
+                            _ => Kind::Note,
+                        };
+                        Entry {
+                            kind,
+                            text: item
+                                .get("text")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            meta: item
+                                .get("meta")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.scroll = 0;
+        self.force_clear = true;
+        Ok(target_id)
     }
 
     fn poll_size(&mut self) -> bool {
@@ -926,6 +1132,25 @@ impl TuiState {
                     &items,
                 );
             }
+            Modal::Session { selected } => {
+                let sessions = list_saved_sessions();
+                let width = cols.saturating_sub(8).clamp(42, 82);
+                let height = rows.saturating_sub(6).clamp(8, 16);
+                let list_h = height - 2;
+                let sel = (*selected).min(sessions.len().saturating_sub(1));
+                let win = sel
+                    .saturating_sub(list_h / 2)
+                    .min(sessions.len().saturating_sub(list_h));
+                let mut items = Vec::new();
+                if sessions.is_empty() {
+                    items.push(("no saved sessions yet".to_string(), false));
+                }
+                for (i, s) in sessions.iter().enumerate().skip(win).take(list_h) {
+                    let line = format!("{:<12} {:<18} {}", s.id, clip(&s.model, 18), s.title);
+                    items.push((line, i == sel));
+                }
+                draw_box(buf, rows, cols, width, height, "Resume session", &items);
+            }
         }
     }
 }
@@ -1067,6 +1292,33 @@ fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
                                 st.model = first.clone();
                             }
                             st.note(format!("Agent {name}: {}", chain.join(" -> ")));
+                        }
+                    }
+                    st.modal = Modal::None;
+                }
+                _ => {}
+            }
+        }
+        Modal::Session { selected } => {
+            let sessions = list_saved_sessions();
+            let last = sessions.len().saturating_sub(1);
+            match key {
+                Key::Esc => st.modal = Modal::None,
+                Key::Up | Key::ScrollUp => {
+                    st.modal = Modal::Session {
+                        selected: selected.saturating_sub(1),
+                    }
+                }
+                Key::Down | Key::ScrollDown => {
+                    st.modal = Modal::Session {
+                        selected: (selected + 1).min(last),
+                    }
+                }
+                Key::Enter => {
+                    if let Some(s) = sessions.get(selected.min(last)) {
+                        match st.load_session(&s.id) {
+                            Ok(id) => st.note(format!("Resumed session {id}")),
+                            Err(e) => st.notice = e,
                         }
                     }
                     st.modal = Modal::None;
@@ -1315,6 +1567,7 @@ fn start_turn(state: &Arc<Mutex<TuiState>>, router: &Arc<ProviderRouter>, text: 
                     ("role", Json::Str("assistant".to_string())),
                     ("content", Json::Str(text)),
                 ]));
+                st.save_session();
             }
             Err(err) => {
                 if let Some(entry) = st.entries.get_mut(idx) {
@@ -1352,7 +1605,7 @@ fn run_command(
     match parts[0] {
         "/quit" | "/exit" | "/q" => return true,
         "/help" | "/?" => st.note(HELP_TEXT.to_string()),
-        "/clear" | "/new" => {
+        "/clear" => {
             if st.busy {
                 st.notice = "Wait for the current response before clearing".to_string();
             } else {
@@ -1361,6 +1614,31 @@ fn run_command(
                 st.scroll = 0;
                 st.force_clear = true;
                 st.notice = "Conversation cleared".to_string();
+            }
+        }
+        "/new" => {
+            if st.busy {
+                st.notice =
+                    "Wait for the current response before starting a new session".to_string();
+            } else {
+                st.save_session();
+                st.session_id = new_session_id();
+                st.history.clear();
+                st.entries.clear();
+                st.scroll = 0;
+                st.force_clear = true;
+                let id = st.session_id.clone();
+                st.note(format!("Started new session {id}"));
+            }
+        }
+        "/resume" | "/sessions" => {
+            if parts.len() == 1 {
+                st.modal = Modal::Session { selected: 0 };
+            } else {
+                match st.load_session(parts[1]) {
+                    Ok(id) => st.note(format!("Resumed session {id}")),
+                    Err(e) => st.notice = e,
+                }
             }
         }
         "/model" | "/m" => {
@@ -1489,12 +1767,23 @@ pub fn run_tui(
     initial_agent: Option<String>,
     initial_model: Option<String>,
     initial_effort: Option<String>,
+    resume_target: Option<String>,
 ) {
-    let _guard = RawTermGuard::enter();
+    let guard = RawTermGuard::enter();
     let rx = spawn_input_thread();
     let state = Arc::new(Mutex::new(TuiState::new(&cfg)));
     {
         let mut st = state.lock().unwrap();
+        if let Some(target) = resume_target {
+            if target == "picker" {
+                st.modal = Modal::Session { selected: 0 };
+            } else {
+                match st.load_session(&target) {
+                    Ok(id) => st.note(format!("Resumed session {id}")),
+                    Err(e) => st.notice = e,
+                }
+            }
+        }
         if let Some(ag) = initial_agent {
             let found = st.agent_entries().into_iter().find(|(n, _, _)| *n == ag);
             if let Some((_, eff, chain)) = found {
@@ -1550,5 +1839,20 @@ pub fn run_tui(
                 }
             }
         }
+    }
+
+    let summary = {
+        let st = state.lock().unwrap();
+        st.save_session();
+        (st.session_id.clone(), !st.history.is_empty())
+    };
+    drop(guard);
+
+    let (session_id, has_messages) = summary;
+    if has_messages {
+        println!("Session: {session_id}");
+        println!("Resume with: cligate --resume {session_id}");
+    } else {
+        println!("Session: {session_id} (empty, not saved)");
     }
 }
