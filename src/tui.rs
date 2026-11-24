@@ -662,9 +662,25 @@ fn write_prefs(st: &TuiState) {
 }
 
 pub fn new_session_id() -> String {
-    let seed = format!("{}-{}", gen_hex_id(""), std::process::id());
-    let hash = fnv1a_hex(&seed);
-    format!("ses_{}", &hash[..8])
+    let mut b = [0u8; 16];
+    let filled = fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut b))
+        .is_ok();
+    if !filled {
+        let seed = format!("{}-{}", gen_hex_id(""), std::process::id());
+        let h = fnv1a_hex(&seed);
+        for (i, chunk) in h.as_bytes().chunks(2).take(16).enumerate() {
+            let s = std::str::from_utf8(chunk).unwrap_or("00");
+            b[i] = u8::from_str_radix(s, 16).unwrap_or(0);
+        }
+    }
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]
+    )
 }
 
 pub fn list_saved_sessions() -> Vec<SessionSummary> {
@@ -1641,7 +1657,8 @@ impl TuiState {
                     items.push(("no saved sessions yet".to_string(), false));
                 }
                 for (i, s) in sessions.iter().enumerate().skip(win).take(list_h) {
-                    let line = format!("{:<12} {:<18} {}", s.id, clip(&s.model, 18), s.title);
+                    let short_id = clip(&s.id, 14);
+                    let line = format!("{short_id:<14} {:<18} {}", clip(&s.model, 18), s.title);
                     items.push((line, i == sel));
                 }
                 draw_box(buf, rows, cols, width, height, "Resume session", &items);

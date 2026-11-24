@@ -3823,9 +3823,8 @@ mod tests {
         assert_eq!(tui::parse_token_limit("abc"), None);
         let s1 = tui::new_session_id();
         let s2 = tui::new_session_id();
-        assert!(s1.starts_with("ses_"));
-        assert_eq!(s1.len(), 12);
+        assert_eq!(s1.len(), 36);
+        assert_eq!(s1.chars().filter(|&c| c == '-').count(), 4);
         assert_ne!(s1, s2);
-        assert_ne!(s1, "ses_10000000");
     }
 }
