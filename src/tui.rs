@@ -24,9 +24,10 @@ const USER_BG: &str = "\x1b[48;5;236m\x1b[38;5;253m";
 const SPINNER: &[&str] = &["·", "✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳", "✢"];
 const EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const COMMANDS: &[(&str, &str)] = &[
-    ("/model", "Switch model"),
+    ("/model", "Switch model and reasoning level"),
     ("/effort", "Set reasoning effort level"),
     ("/agent", "Switch agent fallback chain"),
+    ("/compact", "Summarize and compact conversation history"),
     ("/resume", "Resume a previous session"),
     ("/new", "Start a new session"),
     ("/status", "Show provider health and cooldowns"),
@@ -35,7 +36,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/help", "Show shortcuts"),
     ("/quit", "Exit cligate"),
 ];
-const HELP_TEXT: &str = "Shortcuts\n  /model   F2 / ctrl+n   switch model\n  /effort  F3 / ctrl+t   reasoning effort\n  /agent   F4 / ctrl+g   agent fallback chain\n  /resume                resume a saved session\n  /new                   start a fresh session\n  /status  F5            provider health\n  /reset   ctrl+r        clear rate-limit cooldowns\n  /clear   ctrl+l        clear conversation\n  scroll: mouse wheel, shift+up/down, PgUp/PgDn | stop: esc or ctrl+c | quit: ctrl+c";
+const HELP_TEXT: &str = "Shortcuts\n  /model   F2 / ctrl+n   switch model and effort level\n  /effort  F3 / ctrl+t   reasoning effort\n  /agent   F4 / ctrl+g   agent fallback chain\n  /compact [focus]       compact conversation into a summary\n  /resume                resume a saved session\n  /new                   start a fresh session\n  /status  F5            provider health\n  /reset   ctrl+r        clear rate-limit cooldowns\n  /clear   ctrl+l        clear conversation\n  scroll: mouse wheel, shift+up/down, PgUp/PgDn | stop: esc or ctrl+c | quit: ctrl+c";
 
 struct RawTermGuard {
     saved_state: Option<String>,
@@ -421,10 +422,21 @@ struct Entry {
 #[derive(Clone, PartialEq)]
 enum Modal {
     None,
-    Model { selected: usize, filter: String },
-    Effort { selected: usize },
-    Agent { selected: usize },
-    Session { selected: usize },
+    Model {
+        selected: usize,
+        filter: String,
+    },
+    Effort {
+        selected: usize,
+        levels: Vec<String>,
+        pending_model: Option<(String, String)>,
+    },
+    Agent {
+        selected: usize,
+    },
+    Session {
+        selected: usize,
+    },
 }
 
 #[derive(Clone)]
@@ -527,6 +539,7 @@ struct TuiState {
     modal: Modal,
     sugg_sel: usize,
     busy: bool,
+    busy_label: String,
     busy_since: Instant,
     stream_chars: usize,
     tick: usize,
@@ -557,6 +570,7 @@ impl TuiState {
             modal: Modal::None,
             sugg_sel: 0,
             busy: false,
+            busy_label: "Thinking…".to_string(),
             busy_since: Instant::now(),
             stream_chars: 0,
             tick: 0,
@@ -789,12 +803,27 @@ impl TuiState {
         self.badges = badges;
     }
 
+    fn supported_efforts_for(&self, model_id: &str) -> Vec<String> {
+        let bare = model_id.rsplit('/').next().unwrap_or(model_id);
+        for (m, _, efforts) in all_known_models() {
+            if m == bare {
+                return efforts.iter().map(|s| (*s).to_string()).collect();
+            }
+        }
+        EFFORT_LEVELS.iter().map(|s| (*s).to_string()).collect()
+    }
+
     fn open_effort(&mut self) {
-        let idx = EFFORT_LEVELS
+        let levels = self.supported_efforts_for(&self.model);
+        let idx = levels
             .iter()
-            .position(|e| *e == self.effort)
-            .unwrap_or(1);
-        self.modal = Modal::Effort { selected: idx };
+            .position(|e| e == &self.effort)
+            .unwrap_or_else(|| levels.iter().position(|e| e == "medium").unwrap_or(0));
+        self.modal = Modal::Effort {
+            selected: idx,
+            levels,
+            pending_model: None,
+        };
     }
 
     fn transcript_lines(&self, cols: usize) -> Vec<String> {
@@ -919,7 +948,7 @@ impl TuiState {
         let frame = SPINNER[self.tick % SPINNER.len()];
         let phase = PROGRESS.lock().map(|p| p.clone()).unwrap_or_default();
         let label = if self.stream_chars == 0 {
-            "Thinking…"
+            self.busy_label.as_str()
         } else {
             "Writing…"
         };
@@ -1083,12 +1112,16 @@ impl TuiState {
                 let title = format!("Select model  filter: {filter}");
                 draw_box(buf, rows, cols, width, height, &title, &items);
             }
-            Modal::Effort { selected } => {
-                let items: Vec<(String, bool)> = EFFORT_LEVELS
+            Modal::Effort {
+                selected,
+                levels,
+                pending_model,
+            } => {
+                let items: Vec<(String, bool)> = levels
                     .iter()
                     .enumerate()
                     .map(|(i, lvl)| {
-                        let desc = match *lvl {
+                        let desc = match lvl.as_str() {
                             "low" => "fastest, minimal thinking",
                             "medium" => "balanced speed and reasoning",
                             "high" => "deep thinking for coding",
@@ -1098,8 +1131,13 @@ impl TuiState {
                         (format!("{lvl:<7} {desc}"), i == *selected)
                     })
                     .collect();
-                let width = cols.saturating_sub(6).clamp(30, 56);
-                draw_box(buf, rows, cols, width, 9, "Reasoning effort", &items);
+                let width = cols.saturating_sub(6).clamp(32, 60);
+                let height = (items.len() + 2).clamp(5, 9);
+                let title = match pending_model {
+                    Some((m, prov)) => format!("Reasoning level for {prov}/{m}"),
+                    None => format!("Reasoning level ({})", self.model),
+                };
+                draw_box(buf, rows, cols, width, height, &title, &items);
             }
             Modal::Agent { selected } => {
                 let entries = self.agent_entries();
@@ -1235,36 +1273,66 @@ fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
                     };
                 }
                 Key::Enter => {
-                    if let Some((m, prov, _)) = models.get(selected.min(last)) {
-                        st.model = (*m).to_string();
-                        let eff = st.effort.clone();
+                    if let Some((m, prov, efforts)) = models.get(selected.min(last)) {
+                        let levels: Vec<String> =
+                            efforts.iter().map(|s| (*s).to_string()).collect();
+                        let idx =
+                            levels
+                                .iter()
+                                .position(|e| e == &st.effort)
+                                .unwrap_or_else(|| {
+                                    levels.iter().position(|e| e == "medium").unwrap_or(0)
+                                });
+                        st.modal = Modal::Effort {
+                            selected: idx,
+                            levels,
+                            pending_model: Some(((*m).to_string(), (*prov).to_string())),
+                        };
+                    } else {
+                        st.modal = Modal::None;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Modal::Effort {
+            selected,
+            levels,
+            pending_model,
+        } => {
+            let last = levels.len().saturating_sub(1);
+            match key {
+                Key::Esc | Key::F3 => st.modal = Modal::None,
+                Key::Up | Key::ScrollUp => {
+                    st.modal = Modal::Effort {
+                        selected: selected.saturating_sub(1),
+                        levels,
+                        pending_model,
+                    }
+                }
+                Key::Down | Key::ScrollDown => {
+                    st.modal = Modal::Effort {
+                        selected: (selected + 1).min(last),
+                        levels,
+                        pending_model,
+                    }
+                }
+                Key::Enter => {
+                    if let Some(lvl) = levels.get(selected.min(last)) {
+                        st.effort = lvl.clone();
+                    }
+                    let eff = st.effort.clone();
+                    if let Some((m, prov)) = pending_model {
+                        st.model = m.clone();
                         st.note(format!("Model set to {m} ({prov}, effort {eff})"));
+                    } else {
+                        st.note(format!("Reasoning effort set to {eff}"));
                     }
                     st.modal = Modal::None;
                 }
                 _ => {}
             }
         }
-        Modal::Effort { selected } => match key {
-            Key::Esc | Key::F3 => st.modal = Modal::None,
-            Key::Up | Key::ScrollUp => {
-                st.modal = Modal::Effort {
-                    selected: selected.saturating_sub(1),
-                }
-            }
-            Key::Down | Key::ScrollDown => {
-                st.modal = Modal::Effort {
-                    selected: (selected + 1).min(EFFORT_LEVELS.len() - 1),
-                }
-            }
-            Key::Enter => {
-                st.effort = EFFORT_LEVELS[selected].to_string();
-                let eff = st.effort.clone();
-                st.note(format!("Reasoning effort set to {eff}"));
-                st.modal = Modal::None;
-            }
-            _ => {}
-        },
         Modal::Agent { selected } => {
             let entries = st.agent_entries();
             let last = entries.len().saturating_sub(1);
@@ -1513,6 +1581,7 @@ fn start_turn(state: &Arc<Mutex<TuiState>>, router: &Arc<ProviderRouter>, text: 
             meta: String::new(),
         });
         st.busy = true;
+        st.busy_label = "Thinking…".to_string();
         st.busy_since = Instant::now();
         st.stream_chars = 0;
         st.scroll = 0;
@@ -1591,6 +1660,113 @@ fn start_turn(state: &Arc<Mutex<TuiState>>, router: &Arc<ProviderRouter>, text: 
     });
 }
 
+fn start_compact(state: &Arc<Mutex<TuiState>>, router: &Arc<ProviderRouter>, focus: String) {
+    let (model, effort, agent, snapshot, orig_count) = {
+        let mut st = state.lock().unwrap();
+        if st.busy {
+            st.notice = "Wait for the current response before compacting".to_string();
+            st.render();
+            return;
+        }
+        if st.history.is_empty() {
+            st.notice = "Nothing to compact yet".to_string();
+            st.render();
+            return;
+        }
+        let mut msgs = st.history.clone();
+        let instruction = if focus.trim().is_empty() {
+            "Summarize the conversation above concisely so we can continue seamlessly. Preserve key decisions, file paths, code changes, constraints, and pending next steps.".to_string()
+        } else {
+            format!("Summarize the conversation above concisely with focus on: {}. Preserve key decisions, file paths, code changes, constraints, and pending next steps.", focus.trim())
+        };
+        msgs.push(Json::obj(vec![
+            ("role", Json::Str("user".to_string())),
+            ("content", Json::Str(instruction)),
+        ]));
+        st.busy = true;
+        st.busy_label = "Compacting…".to_string();
+        st.busy_since = Instant::now();
+        st.stream_chars = 0;
+        st.scroll = 0;
+        reset_cancel();
+        if let Ok(mut p) = PROGRESS.lock() {
+            p.clear();
+        }
+        st.render();
+        (
+            st.model.clone(),
+            st.effort.clone(),
+            st.agent.clone(),
+            msgs,
+            st.history.len(),
+        )
+    };
+    let state_t = Arc::clone(state);
+    let router_t = Arc::clone(router);
+    thread::spawn(move || {
+        let started = Instant::now();
+        let mut no_cb: Option<&mut dyn FnMut(&str)> = None;
+        let res = router_t.execute_turn(
+            &snapshot,
+            None,
+            &model,
+            effort,
+            agent.as_deref(),
+            &mut no_cb,
+        );
+        let mut st = state_t.lock().unwrap();
+        st.busy = false;
+        let secs = started.elapsed().as_secs_f32();
+        match res {
+            Ok((summary, _usage, resolved, provider)) => {
+                let clean = summary.trim().to_string();
+                st.history = vec![
+                    Json::obj(vec![
+                        ("role", Json::Str("user".to_string())),
+                        (
+                            "content",
+                            Json::Str(format!("[Compacted conversation summary]\n{clean}")),
+                        ),
+                    ]),
+                    Json::obj(vec![
+                        ("role", Json::Str("assistant".to_string())),
+                        (
+                            "content",
+                            Json::Str(
+                                "Understood. I have the compacted context and am ready to continue."
+                                    .to_string(),
+                            ),
+                        ),
+                    ]),
+                ];
+                st.entries = vec![Entry {
+                    kind: Kind::Note,
+                    text: format!(
+                        "Compacted {orig_count} messages via {resolved} ({provider}) in {secs:.1}s\n{clean}"
+                    ),
+                    meta: String::new(),
+                }];
+                st.scroll = 0;
+                st.force_clear = true;
+                st.save_session();
+            }
+            Err(err) => {
+                if err == "Interrupted by user" {
+                    st.note("Compaction cancelled".to_string());
+                } else {
+                    st.entries.push(Entry {
+                        kind: Kind::Error,
+                        text: format!("Compact failed: {err}"),
+                        meta: String::new(),
+                    });
+                }
+            }
+        }
+        st.refresh_badges(&router_t);
+        st.render();
+    });
+}
+
 fn run_command(
     state: &Arc<Mutex<TuiState>>,
     router: &Arc<ProviderRouter>,
@@ -1630,6 +1806,12 @@ fn run_command(
                 let id = st.session_id.clone();
                 st.note(format!("Started new session {id}"));
             }
+        }
+        "/compact" => {
+            let focus = parts[1..].join(" ");
+            drop(st);
+            start_compact(state, router, focus);
+            return false;
         }
         "/resume" | "/sessions" => {
             if parts.len() == 1 {

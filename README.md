@@ -231,9 +231,10 @@ cligate tui --model gemini-4-neon --effort xhigh
 ```
 
 Inside the TUI:
-- `F2` or `/model`: Open interactive **Model Picker** (filter & select across all 36 native `claude`, `codex`, and `agy` models).
+- `F2` or `/model`: Open interactive **Model & Level Picker** (select from all 36 native `claude`, `codex`, and `agy` models, then immediately choose its reasoning effort level).
 - `F3` or `/effort`: Open interactive **Reasoning Effort Level Picker** (`low`, `medium`, `high`, `xhigh`, `max`).
 - `F4` or `/agent`: Open interactive **Agent Fallback Chain Picker** (or type `/agent set <name> <m1> <m2> <m3> --effort <level>`).
+- `/compact [focus]`: Summarize and compact the conversation history into a concise context summary.
 - `/resume`: Open interactive **Session Picker** to resume any saved conversation (or `/resume <id>`).
 - `/new`: Start a fresh session while keeping the previous one saved.
 - `F5` or `/status`: Display live provider health, cooldown timers, and sticky cache metrics.
