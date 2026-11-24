@@ -33,7 +33,29 @@ Ensure at least one (or all three) of the supported CLIs is installed and logged
 - **Codex CLI**: `codex login`
 - **Antigravity CLI**: `agy auth login`
 
-### 2. Build & Install `cligate` (Rust)
+### 2. Install `cligate` (Prebuilt Binary or From Source)
+
+#### Option A: Download Ready-to-Use Binary (GitHub Releases)
+```bash
+# Linux (ARM64 / aarch64)
+curl -fsSL https://github.com/YudaAdiPratama/cligate/releases/latest/download/cligate-linux-arm64 -o ~/.local/bin/cligate
+chmod +x ~/.local/bin/cligate
+
+# Linux (x86_64 / amd64)
+curl -fsSL https://github.com/YudaAdiPratama/cligate/releases/latest/download/cligate-linux-x86_64 -o ~/.local/bin/cligate
+chmod +x ~/.local/bin/cligate
+
+# macOS (Apple Silicon / ARM64)
+curl -fsSL https://github.com/YudaAdiPratama/cligate/releases/latest/download/cligate-macos-arm64 -o ~/.local/bin/cligate
+chmod +x ~/.local/bin/cligate
+```
+
+Then simply run `cligate` to launch the interactive TUI:
+```bash
+cligate
+```
+
+#### Option B: Build from Source (Rust)
 ```bash
 git clone https://github.com/YudaAdiPratama/cligate.git
 cd cligate

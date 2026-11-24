@@ -2715,7 +2715,12 @@ fn print_help() {
 fn main() {
     let cfg = Config::from_env();
     let args: Vec<String> = env::args().skip(1).collect();
-    if args.is_empty() || matches!(args[0].as_str(), "-h" | "--help" | "help") {
+    if args.is_empty() {
+        let router = build_local_router(&cfg);
+        tui::run_tui(cfg, router, None, None, None);
+        return;
+    }
+    if matches!(args[0].as_str(), "-h" | "--help" | "help") {
         print_help();
         return;
     }
