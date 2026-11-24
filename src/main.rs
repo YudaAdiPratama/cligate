@@ -1,4 +1,5 @@
 mod json;
+mod tools;
 mod tui;
 
 use json::{parse_json, Json};
@@ -46,10 +47,10 @@ pub fn request_cancel() {
     }
 }
 
-struct ActivePidGuard;
+pub(crate) struct ActivePidGuard;
 
 impl ActivePidGuard {
-    fn set(pid: u32) -> Self {
+    pub(crate) fn set(pid: u32) -> Self {
         ACTIVE_CHILD_PID.store(pid, Ordering::SeqCst);
         if is_cancelled() {
             request_cancel();
@@ -2905,6 +2906,7 @@ struct CliRunFlags {
     model: Option<String>,
     effort: Option<String>,
     resume: Option<String>,
+    always_allow: bool,
     prompt: String,
 }
 
@@ -2913,6 +2915,7 @@ fn parse_cli_run_flags(args: &[String]) -> CliRunFlags {
     let mut model = None;
     let mut effort = None;
     let mut resume = None;
+    let mut always_allow = false;
     let mut prompt_parts = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -2928,6 +2931,10 @@ fn parse_cli_run_flags(args: &[String]) -> CliRunFlags {
             "-e" | "--effort" | "--reasoning" if i + 1 < args.len() => {
                 effort = Some(args[i + 1].clone());
                 i += 2;
+            }
+            "--always-allow" | "--dangerously-skip-permissions" => {
+                always_allow = true;
+                i += 1;
             }
             "-c" | "--continue" => {
                 resume = Some("latest".to_string());
@@ -2953,6 +2960,7 @@ fn parse_cli_run_flags(args: &[String]) -> CliRunFlags {
         model,
         effort,
         resume,
+        always_allow,
         prompt: prompt_parts.join(" "),
     }
 }
@@ -2961,8 +2969,8 @@ fn print_help() {
     println!(
         "cligate — OpenAI-Compatible CLI-OAuth Gateway, TUI & Per-Agent Fallback Router\n\n\
          Commands:\n  \
-         cligate [-c|--continue] [-r|--resume [id]] [-a <agent>] [-m <model>] [-e <level>]\n  \
-         cligate tui [-c] [-r [id]] [-a <agent>] [-m <model>] [-e <level>]\n  \
+         cligate [-c|--continue] [-r|--resume [id]] [-a <agent>] [-m <model>] [-e <level>] [--always-allow]\n  \
+         cligate tui [-c] [-r [id]] [-a <agent>] [-m <model>] [-e <level>] [--always-allow]\n  \
          cligate ask [-a <agent>] [-m <model>] [-e <level>] <prompt>\n  \
          cligate serve [--host 127.0.0.1] [--port 8787] [--no-fallback]\n  \
          cligate fallback [on|off|status]                     Toggle or inspect API fallback routing\n  \
@@ -2979,7 +2987,7 @@ fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() {
         let router = build_local_router(&cfg);
-        tui::run_tui(cfg, router, None, None, None, None);
+        tui::run_tui(cfg, router, None, None, None, None, false);
         return;
     }
     if matches!(args[0].as_str(), "-h" | "--help" | "help") {
@@ -2996,6 +3004,7 @@ fn main() {
             flags.model,
             flags.effort,
             flags.resume,
+            flags.always_allow,
         );
         return;
     }
@@ -3011,6 +3020,7 @@ fn main() {
                 flags.model,
                 flags.effort,
                 flags.resume,
+                flags.always_allow,
             );
         }
         "ask" | "run" => {
@@ -3374,6 +3384,63 @@ mod tests {
             ]
         );
         let _ = fs::remove_file(&tmp_path);
+    }
+
+    #[test]
+    fn test_local_tools_and_permissions() {
+        assert_eq!(
+            tools::PermissionMode::parse("always-allow"),
+            Some(tools::PermissionMode::AlwaysAllow)
+        );
+        assert_eq!(
+            tools::PermissionMode::parse("read-only"),
+            Some(tools::PermissionMode::ReadOnly)
+        );
+        assert!(tools::is_read_only_tool("read_file"));
+        assert!(!tools::is_read_only_tool("run_command"));
+
+        let dir = env::temp_dir().join("cligate_tools_test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let cwd = dir.to_string_lossy().into_owned();
+
+        let (ok, _) = tools::execute_local_tool(
+            &cwd,
+            "write_file",
+            &Json::obj(vec![
+                ("path", Json::Str("hello.txt".to_string())),
+                ("content", Json::Str("hello world\n".to_string())),
+            ]),
+        );
+        assert!(ok);
+
+        let (ok, _) = tools::execute_local_tool(
+            &cwd,
+            "edit_file",
+            &Json::obj(vec![
+                ("path", Json::Str("hello.txt".to_string())),
+                ("target", Json::Str("world".to_string())),
+                ("replacement", Json::Str("cligate".to_string())),
+            ]),
+        );
+        assert!(ok);
+
+        let (ok, out) = tools::execute_local_tool(
+            &cwd,
+            "read_file",
+            &Json::obj(vec![("path", Json::Str("hello.txt".to_string()))]),
+        );
+        assert!(ok);
+        assert!(out.contains("1: hello cligate"));
+
+        let (ok, out) = tools::execute_local_tool(
+            &cwd,
+            "run_command",
+            &Json::obj(vec![("command", Json::Str("cat hello.txt".to_string()))]),
+        );
+        assert!(ok);
+        assert!(out.contains("hello cligate"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

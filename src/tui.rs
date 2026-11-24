@@ -1,7 +1,12 @@
 use crate::json::{parse_json, Json};
+use crate::tools::{
+    execute_local_tool, is_read_only_tool, summarize_tool_call, tui_tool_definitions,
+    PermissionMode,
+};
 use crate::{
-    all_known_models, gen_hex_id, home_dir, http_call, infer_provider_and_model, load_agent_routes,
-    now_sec, request_cancel, reset_cancel, Config, ProviderRouter, PROGRESS,
+    all_known_models, gen_hex_id, home_dir, http_call, infer_provider_and_model, is_cancelled,
+    load_agent_routes, now_sec, parse_tool_calls, request_cancel, reset_cancel, Config,
+    ProviderRouter, PROGRESS,
 };
 use std::fs;
 use std::io::{self, Read, Write};
@@ -27,6 +32,10 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/model", "Switch model and reasoning level"),
     ("/effort", "Set reasoning effort level"),
     ("/setfallback", "Configure TUI-only fallback model chain"),
+    (
+        "/permissions",
+        "Configure tool permissions and always-allow",
+    ),
     ("/agent", "Switch agent fallback chain"),
     ("/compact", "Summarize and compact conversation history"),
     ("/resume", "Resume a previous session"),
@@ -37,7 +46,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/help", "Show shortcuts"),
     ("/quit", "Exit cligate"),
 ];
-const HELP_TEXT: &str = "Shortcuts\n  /model       F2 / ctrl+n   switch model and effort level\n  /effort      F3 / ctrl+t   reasoning effort\n  /setfallback [m1 m2 ...]   configure TUI-only fallback chain (or 'reset')\n  /agent       F4 / ctrl+g   agent fallback chain\n  /compact     [focus]       compact conversation into a summary\n  /resume                    resume a saved session\n  /new                       start a fresh session\n  /status      F5            provider health\n  /reset       ctrl+r        clear rate-limit cooldowns\n  /clear       ctrl+l        clear conversation\n  scroll: mouse wheel, shift+up/down, PgUp/PgDn | stop: esc or ctrl+c | quit: ctrl+c";
+const HELP_TEXT: &str = "Shortcuts\n  /model       F2 / ctrl+n   switch model and effort level\n  /effort      F3 / ctrl+t   reasoning effort\n  /setfallback [m1 m2 ...]   configure TUI-only fallback chain (or 'reset')\n  /permissions [mode]        tool permissions (ask, always-allow, read-only, reset)\n  /agent       F4 / ctrl+g   agent fallback chain\n  /compact     [focus]       compact conversation into a summary\n  /resume                    resume a saved session\n  /new                       start a fresh session\n  /status      F5            provider health\n  /reset       ctrl+r        clear rate-limit cooldowns\n  /clear       ctrl+l        clear conversation\n  scroll: mouse wheel, shift+up/down, PgUp/PgDn | stop: esc or ctrl+c | quit: ctrl+c";
 
 struct RawTermGuard {
     saved_state: Option<String>,
@@ -432,6 +441,14 @@ struct Entry {
     meta: String,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PermDecision {
+    AllowOnce,
+    AlwaysAllowTool,
+    AlwaysAllowAll,
+    Deny,
+}
+
 #[derive(Clone, PartialEq)]
 enum Modal {
     None,
@@ -451,6 +468,14 @@ enum Modal {
         selected: usize,
         filter: String,
         chain: Vec<String>,
+    },
+    Permissions {
+        selected: usize,
+    },
+    PermissionPrompt {
+        selected: usize,
+        tool: String,
+        summary: String,
     },
     Session {
         selected: usize,
@@ -485,24 +510,39 @@ fn prefs_path() -> PathBuf {
         .unwrap_or_else(|| home_dir().join(".local/share/cligate/prefs.json"))
 }
 
-fn load_prefs() -> (Option<String>, Option<String>, Vec<String>) {
+struct TuiPrefs {
+    model: Option<String>,
+    effort: Option<String>,
+    fallback_chain: Vec<String>,
+    perm_mode: PermissionMode,
+    always_allow_tools: Vec<String>,
+}
+
+fn load_prefs() -> TuiPrefs {
+    let mut out = TuiPrefs {
+        model: None,
+        effort: None,
+        fallback_chain: Vec::new(),
+        perm_mode: PermissionMode::Ask,
+        always_allow_tools: Vec::new(),
+    };
     let Ok(raw) = fs::read_to_string(prefs_path()) else {
-        return (None, None, Vec::new());
+        return out;
     };
     let Ok(doc) = parse_json(&raw) else {
-        return (None, None, Vec::new());
+        return out;
     };
-    let m = doc
+    out.model = doc
         .get("model")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
-    let e = doc
+    out.effort = doc
         .get("effort")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
-    let fb = doc
+    out.fallback_chain = doc
         .get("fallback_chain")
         .and_then(|v| v.as_arr())
         .map(|arr| {
@@ -511,19 +551,46 @@ fn load_prefs() -> (Option<String>, Option<String>, Vec<String>) {
                 .collect()
         })
         .unwrap_or_default();
-    (m, e, fb)
+    if let Some(m) = doc
+        .get("permission_mode")
+        .and_then(|v| v.as_str())
+        .and_then(PermissionMode::parse)
+    {
+        out.perm_mode = m;
+    }
+    out.always_allow_tools = doc
+        .get("always_allow_tools")
+        .and_then(|v| v.as_arr())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    out
 }
 
-fn save_prefs(model: &str, effort: &str, fallback_chain: &[String]) {
+fn write_prefs(st: &TuiState) {
     let path = prefs_path();
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let fb_json: Vec<Json> = fallback_chain.iter().cloned().map(Json::Str).collect();
+    let fb_json: Vec<Json> = st.tui_fallback.iter().cloned().map(Json::Str).collect();
+    let allow_json: Vec<Json> = st
+        .always_allow_tools
+        .iter()
+        .cloned()
+        .map(Json::Str)
+        .collect();
     let doc = Json::obj(vec![
-        ("model", Json::Str(model.to_string())),
-        ("effort", Json::Str(effort.to_string())),
+        ("model", Json::Str(st.model.clone())),
+        ("effort", Json::Str(st.effort.clone())),
         ("fallback_chain", Json::Arr(fb_json)),
+        (
+            "permission_mode",
+            Json::Str(st.perm_mode.as_str().to_string()),
+        ),
+        ("always_allow_tools", Json::Arr(allow_json)),
     ]);
     let _ = fs::write(path, format!("{}\n", doc.dump_pretty()));
 }
@@ -597,7 +664,11 @@ struct TuiState {
     effort: String,
     agent: Option<String>,
     tui_fallback: Vec<String>,
+    perm_mode: PermissionMode,
+    always_allow_tools: Vec<String>,
+    pending_perm: Option<mpsc::Sender<PermDecision>>,
     routes_path: String,
+    work_dir: String,
     cwd: String,
     history: Vec<Json>,
     entries: Vec<Entry>,
@@ -623,14 +694,21 @@ struct TuiState {
 
 impl TuiState {
     fn new(cfg: &Config) -> Self {
-        let (saved_model, saved_effort, saved_fb) = load_prefs();
+        let prefs = load_prefs();
+        let work_dir = std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| ".".to_string());
         Self {
             session_id: new_session_id(),
-            model: saved_model.unwrap_or_else(|| cfg.default_model.clone()),
-            effort: saved_effort.unwrap_or_else(|| "medium".to_string()),
+            model: prefs.model.unwrap_or_else(|| cfg.default_model.clone()),
+            effort: prefs.effort.unwrap_or_else(|| "medium".to_string()),
             agent: None,
-            tui_fallback: saved_fb,
+            tui_fallback: prefs.fallback_chain,
+            perm_mode: prefs.perm_mode,
+            always_allow_tools: prefs.always_allow_tools,
+            pending_perm: None,
             routes_path: cfg.routes_path.clone(),
+            work_dir,
             cwd: display_cwd(),
             history: Vec::new(),
             entries: Vec::new(),
@@ -1050,8 +1128,20 @@ impl TuiState {
         } else {
             "no agent".to_string()
         };
-        let mut right_plain = format!("{prov}/{bare} · {} · {route_label}  ", self.effort);
-        let mut right_styled = format!("{GRAY}{right_plain}{RESET}");
+        let perm_tag = self.perm_mode.as_str();
+        let mut right_plain = format!(
+            "{prov}/{bare} · {} · {route_label} · {perm_tag}  ",
+            self.effort
+        );
+        let perm_color = match self.perm_mode {
+            PermissionMode::AlwaysAllow => GREEN,
+            PermissionMode::ReadOnly => ACCENT,
+            PermissionMode::Ask => GRAY,
+        };
+        let mut right_styled = format!(
+            "{GRAY}{prov}/{bare} · {} · {route_label} · {RESET}{perm_color}{perm_tag}{RESET}  ",
+            self.effort
+        );
         for (name, state) in &self.badges {
             let (mark, color) = match state {
                 None => ("●", GREEN),
@@ -1283,6 +1373,93 @@ impl TuiState {
                 };
                 draw_box(buf, rows, cols, width, height, &title, &items);
             }
+            Modal::Permissions { selected } => {
+                let mut rows_list = vec![
+                    (
+                        format!(
+                            "ask          Prompt before edits & shell commands{}",
+                            if self.perm_mode == PermissionMode::Ask {
+                                "  (active)"
+                            } else {
+                                ""
+                            }
+                        ),
+                        *selected == 0,
+                    ),
+                    (
+                        format!(
+                            "always-allow Auto-approve all tools without asking{}",
+                            if self.perm_mode == PermissionMode::AlwaysAllow {
+                                "  (active)"
+                            } else {
+                                ""
+                            }
+                        ),
+                        *selected == 1,
+                    ),
+                    (
+                        format!(
+                            "read-only    Allow read/list only, deny writes & shell{}",
+                            if self.perm_mode == PermissionMode::ReadOnly {
+                                "  (active)"
+                            } else {
+                                ""
+                            }
+                        ),
+                        *selected == 2,
+                    ),
+                ];
+                if !self.always_allow_tools.is_empty() {
+                    rows_list.push((
+                        format!(
+                            "clear list   Reset always-allow tools ({})",
+                            self.always_allow_tools.join(", ")
+                        ),
+                        *selected == 3,
+                    ));
+                }
+                let width = cols.saturating_sub(8).clamp(50, 78);
+                let height = rows_list.len() + 3;
+                draw_box(
+                    buf,
+                    rows,
+                    cols,
+                    width,
+                    height,
+                    "Tool Permissions (/permissions)",
+                    &rows_list,
+                );
+            }
+            Modal::PermissionPrompt {
+                selected,
+                tool,
+                summary,
+            } => {
+                let width = cols.saturating_sub(8).clamp(48, 82);
+                let inner = width.saturating_sub(6);
+                let items = vec![
+                    (format!("Tool: {tool}"), false),
+                    (format!("  {}", clip(summary, inner)), false),
+                    (String::new(), false),
+                    ("1. Allow once".to_string(), *selected == 0),
+                    (format!("2. Always allow '{tool}'"), *selected == 1),
+                    ("3. Always allow all tools".to_string(), *selected == 2),
+                    ("4. Deny".to_string(), *selected == 3),
+                    (
+                        "↑↓ / 1-4 / y / n · Enter confirm · Esc deny".to_string(),
+                        false,
+                    ),
+                ];
+                draw_box(
+                    buf,
+                    rows,
+                    cols,
+                    width,
+                    items.len() + 2,
+                    "Permission Required",
+                    &items,
+                );
+            }
             Modal::Session { selected } => {
                 let sessions = list_saved_sessions();
                 let width = cols.saturating_sub(8).clamp(42, 82);
@@ -1348,6 +1525,14 @@ fn draw_box(
 
 fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
     if key == Key::CtrlC {
+        if matches!(st.modal, Modal::PermissionPrompt { .. }) {
+            if let Some(tx) = st.pending_perm.take() {
+                let _ = tx.send(PermDecision::Deny);
+            }
+            request_cancel();
+            st.modal = Modal::None;
+            return Action::None;
+        }
         return Action::Quit;
     }
     match st.modal.clone() {
@@ -1437,10 +1622,10 @@ fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
                     let eff = st.effort.clone();
                     if let Some((m, prov)) = pending_model {
                         st.model = m.clone();
-                        save_prefs(&st.model, &st.effort, &st.tui_fallback);
+                        write_prefs(st);
                         st.note(format!("Model set to {m} ({prov}, effort {eff})"));
                     } else {
-                        save_prefs(&st.model, &st.effort, &st.tui_fallback);
+                        write_prefs(st);
                         st.note(format!("Reasoning effort set to {eff}"));
                     }
                     st.modal = Modal::None;
@@ -1547,6 +1732,118 @@ fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
                     };
                 }
                 _ => {}
+            }
+        }
+        Modal::Permissions { selected } => {
+            let max_idx = if st.always_allow_tools.is_empty() {
+                2
+            } else {
+                3
+            };
+            match key {
+                Key::Esc => st.modal = Modal::None,
+                Key::Up | Key::ScrollUp => {
+                    st.modal = Modal::Permissions {
+                        selected: selected.saturating_sub(1),
+                    }
+                }
+                Key::Down | Key::ScrollDown => {
+                    st.modal = Modal::Permissions {
+                        selected: (selected + 1).min(max_idx),
+                    }
+                }
+                Key::Enter => {
+                    match selected.min(max_idx) {
+                        0 => {
+                            st.perm_mode = PermissionMode::Ask;
+                            write_prefs(st);
+                            st.note(
+                                "Permissions set to ask (prompts before edits & shell)".to_string(),
+                            );
+                        }
+                        1 => {
+                            st.perm_mode = PermissionMode::AlwaysAllow;
+                            write_prefs(st);
+                            st.note(
+                                "Permissions set to always-allow (all tools auto-approved)"
+                                    .to_string(),
+                            );
+                        }
+                        2 => {
+                            st.perm_mode = PermissionMode::ReadOnly;
+                            write_prefs(st);
+                            st.note(
+                                "Permissions set to read-only (writes & shell denied)".to_string(),
+                            );
+                        }
+                        _ => {
+                            st.always_allow_tools.clear();
+                            write_prefs(st);
+                            st.note("Cleared per-tool always-allow list".to_string());
+                        }
+                    }
+                    st.modal = Modal::None;
+                }
+                _ => {}
+            }
+        }
+        Modal::PermissionPrompt {
+            selected,
+            tool,
+            summary,
+        } => {
+            let mut decision: Option<PermDecision> = None;
+            match key {
+                Key::Esc | Key::Char('n') | Key::Char('N') | Key::Char('4') => {
+                    decision = Some(PermDecision::Deny);
+                }
+                Key::Char('y') | Key::Char('Y') | Key::Char('1') => {
+                    decision = Some(PermDecision::AllowOnce);
+                }
+                Key::Char('2') => decision = Some(PermDecision::AlwaysAllowTool),
+                Key::Char('3') => decision = Some(PermDecision::AlwaysAllowAll),
+                Key::Up | Key::ScrollUp => {
+                    st.modal = Modal::PermissionPrompt {
+                        selected: selected.saturating_sub(1),
+                        tool: tool.clone(),
+                        summary,
+                    };
+                }
+                Key::Down | Key::ScrollDown => {
+                    st.modal = Modal::PermissionPrompt {
+                        selected: (selected + 1).min(3),
+                        tool: tool.clone(),
+                        summary,
+                    };
+                }
+                Key::Enter => {
+                    decision = Some(match selected {
+                        0 => PermDecision::AllowOnce,
+                        1 => PermDecision::AlwaysAllowTool,
+                        2 => PermDecision::AlwaysAllowAll,
+                        _ => PermDecision::Deny,
+                    });
+                }
+                _ => {}
+            }
+            if let Some(dec) = decision {
+                match dec {
+                    PermDecision::AlwaysAllowTool => {
+                        if !st.always_allow_tools.iter().any(|t| t == &tool) {
+                            st.always_allow_tools.push(tool.clone());
+                            write_prefs(st);
+                        }
+                    }
+                    PermDecision::AlwaysAllowAll => {
+                        st.perm_mode = PermissionMode::AlwaysAllow;
+                        write_prefs(st);
+                    }
+                    _ => {}
+                }
+                if let Some(tx) = st.pending_perm.take() {
+                    let _ = tx.send(dec);
+                }
+                st.modal = Modal::None;
             }
         }
         Modal::Session { selected } => {
@@ -1760,8 +2057,51 @@ fn status_text(router: &ProviderRouter) -> String {
     out.trim_end().to_string()
 }
 
+fn check_tool_permission(state: &Arc<Mutex<TuiState>>, tool: &str, summary: &str) -> bool {
+    if is_read_only_tool(tool) {
+        return true;
+    }
+    let rx = {
+        let mut st = state.lock().unwrap();
+        match st.perm_mode {
+            PermissionMode::AlwaysAllow => return true,
+            PermissionMode::ReadOnly => return false,
+            PermissionMode::Ask => {
+                if st.always_allow_tools.iter().any(|t| t == tool) {
+                    return true;
+                }
+                let (tx, rx) = mpsc::channel();
+                st.pending_perm = Some(tx);
+                st.modal = Modal::PermissionPrompt {
+                    selected: 0,
+                    tool: tool.to_string(),
+                    summary: summary.to_string(),
+                };
+                st.dirty = true;
+                rx
+            }
+        }
+    };
+    loop {
+        if is_cancelled() {
+            let mut st = state.lock().unwrap();
+            st.pending_perm = None;
+            if matches!(st.modal, Modal::PermissionPrompt { .. }) {
+                st.modal = Modal::None;
+            }
+            return false;
+        }
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(PermDecision::Deny) => return false,
+            Ok(_) => return true,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => return false,
+        }
+    }
+}
+
 fn start_turn(state: &Arc<Mutex<TuiState>>, router: &Arc<ProviderRouter>, text: String) {
-    let (model, effort, agent, tui_fallback, snapshot, idx) = {
+    let (model, effort, agent, tui_fallback, work_dir) = {
         let mut st = state.lock().unwrap();
         st.history.push(Json::obj(vec![
             ("role", Json::Str("user".to_string())),
@@ -1770,11 +2110,6 @@ fn start_turn(state: &Arc<Mutex<TuiState>>, router: &Arc<ProviderRouter>, text: 
         st.entries.push(Entry {
             kind: Kind::User,
             text,
-            meta: String::new(),
-        });
-        st.entries.push(Entry {
-            kind: Kind::Assistant,
-            text: String::new(),
             meta: String::new(),
         });
         st.busy = true;
@@ -1797,75 +2132,187 @@ fn start_turn(state: &Arc<Mutex<TuiState>>, router: &Arc<ProviderRouter>, text: 
             st.effort.clone(),
             st.agent.clone(),
             fb,
-            st.history.clone(),
-            st.entries.len() - 1,
+            st.work_dir.clone(),
         )
     };
     let state_t = Arc::clone(state);
     let router_t = Arc::clone(router);
     thread::spawn(move || {
         let started = Instant::now();
-        let mut acc = String::new();
-        let res = {
-            let state_cb = Arc::clone(&state_t);
-            let mut on_delta = |chunk: &str| {
-                acc.push_str(chunk);
-                if let Ok(mut st) = state_cb.lock() {
-                    st.stream_chars = acc.chars().count();
-                    if let Some(entry) = st.entries.get_mut(idx) {
-                        entry.text = acc.clone();
-                    }
-                    st.dirty = true;
-                }
+        let tool_defs = tui_tool_definitions();
+        let sys_msg = Json::obj(vec![
+            ("role", Json::Str("system".to_string())),
+            (
+                "content",
+                Json::Str(format!(
+                    "You are a coding assistant in working directory {work_dir}. Use the provided caller tools when you need to inspect files, edit code, or run shell commands."
+                )),
+            ),
+        ]);
+
+        for _round in 0..12 {
+            let (snapshot, idx) = {
+                let mut st = state_t.lock().unwrap();
+                st.entries.push(Entry {
+                    kind: Kind::Assistant,
+                    text: String::new(),
+                    meta: String::new(),
+                });
+                st.stream_chars = 0;
+                st.busy_label = "Thinking…".to_string();
+                st.dirty = true;
+                let mut msgs = vec![sys_msg.clone()];
+                msgs.extend(st.history.clone());
+                (msgs, st.entries.len() - 1)
             };
-            let mut cb: Option<&mut dyn FnMut(&str)> = Some(&mut on_delta);
-            router_t.execute_turn_with_chain(
-                &snapshot,
-                None,
-                &model,
-                effort,
-                agent.as_deref(),
-                tui_fallback.as_deref(),
-                &mut cb,
-            )
-        };
-        let mut st = state_t.lock().unwrap();
-        st.busy = false;
-        let secs = started.elapsed().as_secs_f32();
-        match res {
-            Ok((final_text, _usage, resolved, provider)) => {
-                let text = if final_text.is_empty() {
-                    acc
-                } else {
-                    final_text
-                };
-                if let Some(entry) = st.entries.get_mut(idx) {
-                    entry.text = text.clone();
-                    entry.meta = format!("{resolved} via {provider} in {secs:.1}s");
-                }
-                st.history.push(Json::obj(vec![
-                    ("role", Json::Str("assistant".to_string())),
-                    ("content", Json::Str(text)),
-                ]));
-                st.save_session();
-            }
-            Err(err) => {
-                if let Some(entry) = st.entries.get_mut(idx) {
-                    if err == "Interrupted by user" {
-                        if !acc.is_empty() {
-                            entry.text = acc;
-                            entry.meta = format!("interrupted after {secs:.1}s");
-                        } else {
-                            entry.kind = Kind::Note;
-                            entry.text = "Interrupted by user".to_string();
+
+            let mut acc = String::new();
+            let res = {
+                let state_cb = Arc::clone(&state_t);
+                let mut on_delta = |chunk: &str| {
+                    acc.push_str(chunk);
+                    if let Ok(mut st) = state_cb.lock() {
+                        st.stream_chars = acc.chars().count();
+                        if !acc.contains("<tool_call>") {
+                            if let Some(entry) = st.entries.get_mut(idx) {
+                                entry.text = acc.clone();
+                            }
                         }
-                    } else {
-                        entry.kind = Kind::Error;
-                        entry.text = err;
+                        st.dirty = true;
                     }
+                };
+                let mut cb: Option<&mut dyn FnMut(&str)> = Some(&mut on_delta);
+                router_t.execute_turn_with_chain(
+                    &snapshot,
+                    Some(&tool_defs),
+                    &model,
+                    effort.clone(),
+                    agent.as_deref(),
+                    tui_fallback.as_deref(),
+                    &mut cb,
+                )
+            };
+
+            let secs = started.elapsed().as_secs_f32();
+            match res {
+                Ok((final_text, _usage, resolved, provider)) => {
+                    let raw = if final_text.is_empty() {
+                        acc
+                    } else {
+                        final_text
+                    };
+                    let (cleaned, tool_calls) = parse_tool_calls(&raw);
+                    if tool_calls.is_empty() {
+                        let mut st = state_t.lock().unwrap();
+                        if let Some(entry) = st.entries.get_mut(idx) {
+                            entry.text = cleaned.clone();
+                            entry.meta = format!("{resolved} via {provider} in {secs:.1}s");
+                        }
+                        st.history.push(Json::obj(vec![
+                            ("role", Json::Str("assistant".to_string())),
+                            ("content", Json::Str(cleaned)),
+                        ]));
+                        st.save_session();
+                        break;
+                    }
+
+                    {
+                        let mut st = state_t.lock().unwrap();
+                        if cleaned.trim().is_empty() {
+                            if st.entries.len() == idx + 1 {
+                                st.entries.pop();
+                            }
+                        } else if let Some(entry) = st.entries.get_mut(idx) {
+                            entry.text = cleaned.clone();
+                        }
+                        st.history.push(Json::obj(vec![
+                            ("role", Json::Str("assistant".to_string())),
+                            ("content", Json::Str(cleaned)),
+                            ("tool_calls", Json::Arr(tool_calls.clone())),
+                        ]));
+                        st.dirty = true;
+                    }
+
+                    for tc in &tool_calls {
+                        if is_cancelled() {
+                            break;
+                        }
+                        let call_id = tc
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("call_0")
+                            .to_string();
+                        let fn_obj = tc.get("function");
+                        let name = fn_obj
+                            .and_then(|f| f.get("name"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let args_raw = fn_obj
+                            .and_then(|f| f.get("arguments"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("{}");
+                        let args = parse_json(args_raw).unwrap_or_else(|_| Json::Obj(Vec::new()));
+                        let summary = summarize_tool_call(&name, &args);
+
+                        let allowed = check_tool_permission(&state_t, &name, &summary);
+                        let (ok, output) = if allowed {
+                            {
+                                let mut st = state_t.lock().unwrap();
+                                st.busy_label = format!("Running {name}…");
+                                st.dirty = true;
+                            }
+                            execute_local_tool(&work_dir, &name, &args)
+                        } else {
+                            let reason = if is_cancelled() {
+                                "Cancelled by user".to_string()
+                            } else {
+                                format!("Denied by user/permission mode for tool '{name}'")
+                            };
+                            (false, reason)
+                        };
+
+                        let mut st = state_t.lock().unwrap();
+                        let mark = if ok { "✓" } else { "✗" };
+                        st.note(format!("{mark} {name}: {}", clip(&summary, 80)));
+                        st.history.push(Json::obj(vec![
+                            ("role", Json::Str("tool".to_string())),
+                            ("tool_call_id", Json::Str(call_id)),
+                            ("name", Json::Str(name)),
+                            ("content", Json::Str(output)),
+                        ]));
+                        st.dirty = true;
+                    }
+
+                    if is_cancelled() {
+                        let mut st = state_t.lock().unwrap();
+                        st.note("Interrupted by user".to_string());
+                        break;
+                    }
+                }
+                Err(err) => {
+                    let mut st = state_t.lock().unwrap();
+                    if let Some(entry) = st.entries.get_mut(idx) {
+                        if err == "Interrupted by user" {
+                            if !acc.is_empty() {
+                                entry.text = acc;
+                                entry.meta = format!("interrupted after {secs:.1}s");
+                            } else {
+                                entry.kind = Kind::Note;
+                                entry.text = "Interrupted by user".to_string();
+                            }
+                        } else {
+                            entry.kind = Kind::Error;
+                            entry.text = err;
+                        }
+                    }
+                    break;
                 }
             }
         }
+
+        let mut st = state_t.lock().unwrap();
+        st.busy = false;
         st.refresh_badges(&router_t);
         st.render();
     });
@@ -2063,7 +2510,7 @@ fn run_command(
                     }
                 }
                 let (model, eff) = (st.model.clone(), st.effort.clone());
-                save_prefs(&st.model, &st.effort, &st.tui_fallback);
+                write_prefs(&st);
                 st.note(format!("Model set to {model} (effort {eff})"));
             }
         }
@@ -2074,11 +2521,32 @@ fn run_command(
                 let lvl = parts[1].to_lowercase();
                 if EFFORT_LEVELS.contains(&lvl.as_str()) {
                     st.effort = lvl.clone();
-                    save_prefs(&st.model, &st.effort, &st.tui_fallback);
+                    write_prefs(&st);
                     st.note(format!("Reasoning effort set to {lvl}"));
                 } else {
                     st.notice = "Effort must be one of low, medium, high, xhigh, max".to_string();
                 }
+            }
+        }
+        "/permissions" | "/perm" | "/allow" => {
+            if parts.len() == 1 {
+                let sel = match st.perm_mode {
+                    PermissionMode::Ask => 0,
+                    PermissionMode::AlwaysAllow => 1,
+                    PermissionMode::ReadOnly => 2,
+                };
+                st.modal = Modal::Permissions { selected: sel };
+            } else if matches!(parts[1].to_lowercase().as_str(), "reset" | "clear") {
+                st.perm_mode = PermissionMode::Ask;
+                st.always_allow_tools.clear();
+                write_prefs(&st);
+                st.note("Permissions reset to ask and allowlist cleared".to_string());
+            } else if let Some(mode) = PermissionMode::parse(parts[1]) {
+                st.perm_mode = mode;
+                write_prefs(&st);
+                st.note(format!("Permissions set to {}", mode.as_str()));
+            } else {
+                st.notice = "Usage: /permissions [ask|always-allow|read-only|reset]".to_string();
             }
         }
         "/setfallback" | "/setfalback" | "/fallback" => {
@@ -2090,7 +2558,7 @@ fn run_command(
                 };
             } else if matches!(parts[1].to_lowercase().as_str(), "reset" | "clear" | "off") {
                 st.tui_fallback.clear();
-                save_prefs(&st.model, &st.effort, &st.tui_fallback);
+                write_prefs(&st);
                 st.note("TUI fallback chain cleared (API routes unchanged)".to_string());
             } else {
                 let mut models = Vec::new();
@@ -2151,7 +2619,7 @@ fn apply_tui_fallback_chain(st: &mut TuiState, models: &[String], eff_ov: Option
         st.model = first.clone();
     }
     st.effort = eff_val.clone();
-    save_prefs(&st.model, &st.effort, &st.tui_fallback);
+    write_prefs(st);
     st.note(format!(
         "TUI fallback chain saved (TUI only, effort {eff_val}): {}",
         models.join(" -> ")
@@ -2223,12 +2691,16 @@ pub fn run_tui(
     initial_model: Option<String>,
     initial_effort: Option<String>,
     resume_target: Option<String>,
+    always_allow: bool,
 ) {
     let guard = RawTermGuard::enter();
     let rx = spawn_input_thread();
     let state = Arc::new(Mutex::new(TuiState::new(&cfg)));
     {
         let mut st = state.lock().unwrap();
+        if always_allow {
+            st.perm_mode = PermissionMode::AlwaysAllow;
+        }
         if let Some(target) = resume_target {
             if target == "picker" {
                 st.modal = Modal::Session { selected: 0 };
