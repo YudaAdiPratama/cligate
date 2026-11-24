@@ -1,4 +1,5 @@
 mod json;
+mod tui;
 
 use json::{parse_json, Json};
 use std::collections::{HashMap, HashSet};
@@ -2658,15 +2659,55 @@ fn cmd_models(filter_provider: &str) {
     }
 }
 
+fn build_local_router(cfg: &Config) -> Arc<ProviderRouter> {
+    let _ = fs::create_dir_all(&cfg.workdir);
+    let standby = Arc::new(StandbyModelPool::new(cfg.clone()));
+    let sticky = Arc::new(StickySessionManager::new(cfg.clone(), standby));
+    Arc::new(ProviderRouter::new(cfg.clone(), sticky))
+}
+
+fn parse_cli_run_flags(
+    args: &[String],
+) -> (Option<String>, Option<String>, Option<String>, String) {
+    let mut agent = None;
+    let mut model = None;
+    let mut effort = None;
+    let mut prompt_parts = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-a" | "--agent" if i + 1 < args.len() => {
+                agent = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "-m" | "--model" if i + 1 < args.len() => {
+                model = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "-e" | "--effort" | "--reasoning" if i + 1 < args.len() => {
+                effort = Some(args[i + 1].clone());
+                i += 2;
+            }
+            other => {
+                prompt_parts.push(other.to_string());
+                i += 1;
+            }
+        }
+    }
+    (agent, model, effort, prompt_parts.join(" "))
+}
+
 fn print_help() {
     println!(
-        "cligate — OpenAI-Compatible CLI-OAuth Gateway & Per-Agent Fallback Router\n\n\
+        "cligate — OpenAI-Compatible CLI-OAuth Gateway, TUI & Per-Agent Fallback Router\n\n\
          Commands:\n  \
-         cligate serve [--host 127.0.0.1] [--port 8787]\n  \
-         cligate status                                  Show live router health, cooldowns & cache\n  \
-         cligate models [claude|codex|agy]               List native models & supported effort levels\n  \
-         cligate reset [claude|codex|agy]                Reset provider rate-limit cooldowns\n  \
-         cligate agent status                            Show per-agent primary & fallback model chains\n  \
+         cligate tui [-a <agent>] [-m <model>] [-e <level>]   Launch interactive Terminal UI (TUI)\n  \
+         cligate ask [-a <agent>] [-m <model>] [-e <level>] <prompt>\n  \
+         cligate serve [--host 127.0.0.1] [--port 8787]       Start OpenAI HTTP gateway server\n  \
+         cligate status                                       Show live router health, cooldowns & cache\n  \
+         cligate models [claude|codex|agy]                    List native models & supported effort levels\n  \
+         cligate reset [claude|codex|agy]                     Reset provider rate-limit cooldowns\n  \
+         cligate agent status                                 Show per-agent primary & fallback model chains\n  \
          cligate agent set <agent> <m1> <m2> [m3 ...] [--effort <low|medium|high|xhigh|max>]"
     );
 }
@@ -2680,6 +2721,55 @@ fn main() {
     }
 
     match args[0].as_str() {
+        "tui" | "chat" => {
+            let (agent, model, effort, _) = parse_cli_run_flags(&args[1..]);
+            let router = build_local_router(&cfg);
+            tui::run_tui(cfg, router, agent, model, effort);
+        }
+        "ask" | "run" => {
+            let (agent, model, effort, prompt) = parse_cli_run_flags(&args[1..]);
+            if prompt.trim().is_empty() {
+                eprintln!("Usage: cligate ask [-a <agent>] [-m <model>] [-e <effort>] <prompt>");
+                std::process::exit(1);
+            }
+            let router = build_local_router(&cfg);
+            let req_model = model.unwrap_or_else(|| cfg.default_model.clone());
+            let req_effort = effort.unwrap_or_else(|| "medium".to_string());
+            let messages = vec![Json::obj(vec![
+                ("role", Json::Str("user".to_string())),
+                ("content", Json::Str(prompt)),
+            ])];
+            let mut printed_delta = false;
+            let res = {
+                let mut on_delta = |chunk: &str| {
+                    printed_delta = true;
+                    print!("{chunk}");
+                    let _ = std::io::stdout().flush();
+                };
+                let mut cb_opt: Option<&mut dyn FnMut(&str)> = Some(&mut on_delta);
+                router.execute_turn(
+                    &messages,
+                    None,
+                    &req_model,
+                    req_effort,
+                    agent.as_deref(),
+                    &mut cb_opt,
+                )
+            };
+            match res {
+                Ok((final_text, _, _, _)) => {
+                    if !printed_delta {
+                        println!("{final_text}");
+                    } else {
+                        println!();
+                    }
+                }
+                Err(e) => {
+                    eprintln!("\nError: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         "serve" => {
             let mut host_ov = None;
             let mut port_ov = None;
@@ -2883,5 +2973,11 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("run_command")
         );
+    }
+
+    #[test]
+    fn test_tui_text_wrapping() {
+        let lines = tui::wrap_text_lines("hello world\nsecond line", 10);
+        assert_eq!(lines, vec!["hello worl", "d", "second lin", "e"]);
     }
 }
