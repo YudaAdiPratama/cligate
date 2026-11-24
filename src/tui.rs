@@ -38,6 +38,10 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     ("/agent", "Switch agent fallback chain"),
     ("/compact", "Summarize and compact conversation history"),
+    (
+        "/maxwindow",
+        "Set auto-compact context window limit (or 'off')",
+    ),
     ("/resume", "Resume a previous session"),
     ("/new", "Start a new session"),
     ("/status", "Show provider health and cooldowns"),
@@ -46,7 +50,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/help", "Show shortcuts"),
     ("/quit", "Exit cligate"),
 ];
-const HELP_TEXT: &str = "Shortcuts\n  /model       F2 / ctrl+n   switch model and effort level\n  /effort      F3 / ctrl+t   reasoning effort\n  /setfallback [m1 m2 ...]   configure TUI-only fallback chain (or 'reset')\n  /permissions [mode]        tool permissions (ask, always-allow, read-only, reset)\n  /agent       F4 / ctrl+g   agent fallback chain\n  /compact     [focus]       compact conversation into a summary\n  /resume                    resume a saved session\n  /new                       start a fresh session\n  /status      F5            provider health\n  /reset       ctrl+r        clear rate-limit cooldowns\n  /clear       ctrl+l        clear conversation\n  scroll: mouse wheel, shift+up/down, PgUp/PgDn | stop: esc or ctrl+c | quit: ctrl+c";
+const HELP_TEXT: &str = "Shortcuts\n  /model       F2 / ctrl+n   switch model and effort level\n  /effort      F3 / ctrl+t   reasoning effort\n  /setfallback [m1 m2 ...]   configure TUI-only fallback chain (or 'reset')\n  /permissions [mode]        tool permissions (ask, always-allow, read-only, reset)\n  /agent       F4 / ctrl+g   agent fallback chain\n  /compact     [focus]       compact conversation into a summary\n  /maxwindow   [32k|64k|off] set auto-compact token limit\n  /resume                    resume a saved session\n  /new                       start a fresh session\n  /status      F5            provider health\n  /reset       ctrl+r        clear rate-limit cooldowns\n  /clear       ctrl+l        clear conversation\n  scroll: mouse wheel, shift+up/down, PgUp/PgDn | stop: esc or ctrl+c | quit: ctrl+c";
 
 struct RawTermGuard {
     saved_state: Option<String>,
@@ -477,6 +481,9 @@ enum Modal {
         tool: String,
         summary: String,
     },
+    MaxWindow {
+        selected: usize,
+    },
     Session {
         selected: usize,
     },
@@ -510,12 +517,58 @@ fn prefs_path() -> PathBuf {
         .unwrap_or_else(|| home_dir().join(".local/share/cligate/prefs.json"))
 }
 
+const MAX_WINDOW_PRESETS: &[(usize, &str)] = &[
+    (0, "off     Disable automatic compaction"),
+    (32_000, "32k     Auto-compact around 32,000 tokens"),
+    (64_000, "64k     Auto-compact around 64,000 tokens"),
+    (128_000, "128k    Auto-compact around 128,000 tokens"),
+    (200_000, "200k    Auto-compact around 200,000 tokens"),
+];
+
+pub fn parse_token_limit(raw: &str) -> Option<usize> {
+    let s = raw.trim().to_lowercase();
+    if matches!(s.as_str(), "off" | "0" | "none" | "disable" | "disabled") {
+        return Some(0);
+    }
+    let parsed = if let Some(n) = s.strip_suffix('k') {
+        n.trim()
+            .parse::<usize>()
+            .ok()
+            .map(|v| v.saturating_mul(1_000))
+    } else if let Some(n) = s.strip_suffix('m') {
+        n.trim()
+            .parse::<usize>()
+            .ok()
+            .map(|v| v.saturating_mul(1_000_000))
+    } else {
+        s.parse::<usize>().ok()
+    }?;
+    Some(parsed.max(4_000))
+}
+
+fn format_tokens_short(n: usize) -> String {
+    if n == 0 {
+        "off".to_string()
+    } else if n >= 1_000_000 && n.is_multiple_of(1_000_000) {
+        format!("{}m", n / 1_000_000)
+    } else if n >= 1_000 {
+        format!("{}k", n / 1_000)
+    } else {
+        n.to_string()
+    }
+}
+
+fn estimate_history_tokens(history: &[Json]) -> usize {
+    history.iter().map(|m| m.dump().len() / 4).sum()
+}
+
 struct TuiPrefs {
     model: Option<String>,
     effort: Option<String>,
     fallback_chain: Vec<String>,
     perm_mode: PermissionMode,
     always_allow_tools: Vec<String>,
+    auto_compact_tokens: usize,
 }
 
 fn load_prefs() -> TuiPrefs {
@@ -525,6 +578,7 @@ fn load_prefs() -> TuiPrefs {
         fallback_chain: Vec::new(),
         perm_mode: PermissionMode::Ask,
         always_allow_tools: Vec::new(),
+        auto_compact_tokens: 0,
     };
     let Ok(raw) = fs::read_to_string(prefs_path()) else {
         return out;
@@ -567,6 +621,11 @@ fn load_prefs() -> TuiPrefs {
                 .collect()
         })
         .unwrap_or_default();
+    out.auto_compact_tokens = doc
+        .get("auto_compact_tokens")
+        .and_then(|v| v.as_i64())
+        .map(|v| v.max(0) as usize)
+        .unwrap_or(0);
     out
 }
 
@@ -591,6 +650,10 @@ fn write_prefs(st: &TuiState) {
             Json::Str(st.perm_mode.as_str().to_string()),
         ),
         ("always_allow_tools", Json::Arr(allow_json)),
+        (
+            "auto_compact_tokens",
+            Json::Num(st.auto_compact_tokens as f64),
+        ),
     ]);
     let _ = fs::write(path, format!("{}\n", doc.dump_pretty()));
 }
@@ -666,6 +729,7 @@ struct TuiState {
     tui_fallback: Vec<String>,
     perm_mode: PermissionMode,
     always_allow_tools: Vec<String>,
+    auto_compact_tokens: usize,
     pending_perm: Option<mpsc::Sender<PermDecision>>,
     routes_path: String,
     work_dir: String,
@@ -706,6 +770,7 @@ impl TuiState {
             tui_fallback: prefs.fallback_chain,
             perm_mode: prefs.perm_mode,
             always_allow_tools: prefs.always_allow_tools,
+            auto_compact_tokens: prefs.auto_compact_tokens,
             pending_perm: None,
             routes_path: cfg.routes_path.clone(),
             work_dir,
@@ -1129,8 +1194,18 @@ impl TuiState {
             "no agent".to_string()
         };
         let perm_tag = self.perm_mode.as_str();
+        let ctx_tag = if self.auto_compact_tokens > 0 {
+            let used = estimate_history_tokens(&self.history);
+            format!(
+                " · ctx {}/{}",
+                format_tokens_short(used),
+                format_tokens_short(self.auto_compact_tokens)
+            )
+        } else {
+            String::new()
+        };
         let mut right_plain = format!(
-            "{prov}/{bare} · {} · {route_label} · {perm_tag}  ",
+            "{prov}/{bare} · {} · {route_label} · {perm_tag}{ctx_tag}  ",
             self.effort
         );
         let perm_color = match self.perm_mode {
@@ -1139,7 +1214,7 @@ impl TuiState {
             PermissionMode::Ask => GRAY,
         };
         let mut right_styled = format!(
-            "{GRAY}{prov}/{bare} · {} · {route_label} · {RESET}{perm_color}{perm_tag}{RESET}  ",
+            "{GRAY}{prov}/{bare} · {} · {route_label} · {RESET}{perm_color}{perm_tag}{RESET}{GRAY}{ctx_tag}{RESET}  ",
             self.effort
         );
         for (name, state) in &self.badges {
@@ -1457,6 +1532,31 @@ impl TuiState {
                     width,
                     items.len() + 2,
                     "Permission Required",
+                    &items,
+                );
+            }
+            Modal::MaxWindow { selected } => {
+                let items: Vec<(String, bool)> = MAX_WINDOW_PRESETS
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (val, label))| {
+                        let mark = if *val == self.auto_compact_tokens {
+                            "  (active)"
+                        } else {
+                            ""
+                        };
+                        (format!("{label}{mark}"), i == *selected)
+                    })
+                    .collect();
+                let width = cols.saturating_sub(8).clamp(48, 76);
+                let height = items.len() + 3;
+                draw_box(
+                    buf,
+                    rows,
+                    cols,
+                    width,
+                    height,
+                    "Auto-Compact Max Window (/maxwindow <val>)",
                     &items,
                 );
             }
@@ -1844,6 +1944,38 @@ fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
                     let _ = tx.send(dec);
                 }
                 st.modal = Modal::None;
+            }
+        }
+        Modal::MaxWindow { selected } => {
+            let last = MAX_WINDOW_PRESETS.len().saturating_sub(1);
+            match key {
+                Key::Esc => st.modal = Modal::None,
+                Key::Up | Key::ScrollUp => {
+                    st.modal = Modal::MaxWindow {
+                        selected: selected.saturating_sub(1),
+                    }
+                }
+                Key::Down | Key::ScrollDown => {
+                    st.modal = Modal::MaxWindow {
+                        selected: (selected + 1).min(last),
+                    }
+                }
+                Key::Enter => {
+                    if let Some((val, _)) = MAX_WINDOW_PRESETS.get(selected.min(last)) {
+                        st.auto_compact_tokens = *val;
+                        write_prefs(st);
+                        if *val == 0 {
+                            st.note("Auto-compact disabled".to_string());
+                        } else {
+                            st.note(format!(
+                                "Auto-compact max window set to {} tokens",
+                                format_tokens_short(*val)
+                            ));
+                        }
+                    }
+                    st.modal = Modal::None;
+                }
+                _ => {}
             }
         }
         Modal::Session { selected } => {
@@ -2311,6 +2443,70 @@ fn start_turn(state: &Arc<Mutex<TuiState>>, router: &Arc<ProviderRouter>, text: 
             }
         }
 
+        let auto_compact_req = {
+            let mut st = state_t.lock().unwrap();
+            let used = estimate_history_tokens(&st.history);
+            if !is_cancelled()
+                && st.auto_compact_tokens > 0
+                && st.history.len() >= 4
+                && used >= st.auto_compact_tokens
+            {
+                st.busy_label = "Auto-compacting…".to_string();
+                st.stream_chars = 0;
+                st.dirty = true;
+                let mut msgs = st.history.clone();
+                msgs.push(Json::obj(vec![
+                    ("role", Json::Str("user".to_string())),
+                    (
+                        "content",
+                        Json::Str(
+                            "Summarize the conversation above concisely so we can continue seamlessly. Preserve key decisions, file paths, code changes, constraints, and pending next steps.".to_string(),
+                        ),
+                    ),
+                ]));
+                Some((msgs, st.history.len(), used, st.auto_compact_tokens))
+            } else {
+                None
+            }
+        };
+
+        if let Some((compact_msgs, orig_count, used_tok, limit_tok)) = auto_compact_req {
+            let mut no_cb: Option<&mut dyn FnMut(&str)> = None;
+            if let Ok((summary, _, _, _)) = router_t.execute_turn_with_chain(
+                &compact_msgs,
+                None,
+                &model,
+                effort,
+                agent.as_deref(),
+                tui_fallback.as_deref(),
+                &mut no_cb,
+            ) {
+                let clean = summary.trim().to_string();
+                let mut st = state_t.lock().unwrap();
+                st.history = vec![
+                    Json::obj(vec![
+                        ("role", Json::Str("user".to_string())),
+                        (
+                            "content",
+                            Json::Str("Previous conversation summary:".to_string()),
+                        ),
+                    ]),
+                    Json::obj(vec![
+                        ("role", Json::Str("assistant".to_string())),
+                        ("content", Json::Str(clean)),
+                    ]),
+                ];
+                let after_tok = estimate_history_tokens(&st.history);
+                st.save_session();
+                st.note(format!(
+                    "Auto-compacted {orig_count} messages (~{} -> ~{}, limit {})",
+                    format_tokens_short(used_tok),
+                    format_tokens_short(after_tok),
+                    format_tokens_short(limit_tok)
+                ));
+            }
+        }
+
         let mut st = state_t.lock().unwrap();
         st.busy = false;
         st.refresh_badges(&router_t);
@@ -2526,6 +2722,30 @@ fn run_command(
                 } else {
                     st.notice = "Effort must be one of low, medium, high, xhigh, max".to_string();
                 }
+            }
+        }
+        "/maxwindow" | "/autocompact" | "/window" => {
+            if parts.len() == 1 {
+                let sel = MAX_WINDOW_PRESETS
+                    .iter()
+                    .position(|(v, _)| *v == st.auto_compact_tokens)
+                    .unwrap_or(0);
+                st.modal = Modal::MaxWindow { selected: sel };
+            } else if let Some(limit) = parse_token_limit(parts[1]) {
+                st.auto_compact_tokens = limit;
+                write_prefs(&st);
+                let used = estimate_history_tokens(&st.history);
+                if limit == 0 {
+                    st.note("Auto-compact disabled".to_string());
+                } else {
+                    st.note(format!(
+                        "Auto-compact max window set to {} (current ~{} tokens)",
+                        format_tokens_short(limit),
+                        format_tokens_short(used)
+                    ));
+                }
+            } else {
+                st.notice = "Usage: /maxwindow [off|32k|64k|128k|200k|<tokens>]".to_string();
             }
         }
         "/permissions" | "/perm" | "/allow" => {

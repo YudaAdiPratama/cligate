@@ -239,6 +239,7 @@ Inside the TUI:
 - `/setfallback [m1 m2 m3]`: Interactively build or update a TUI-only fallback model chain (`Primary -> Fallback #1 -> Fallback #2`, or `/setfallback reset` to clear). Saved locally in `~/.local/share/cligate/prefs.json` without affecting the API server or `agent_routes.json`.
 - `F4` or `/agent`: Open interactive **Agent Fallback Chain Picker** (or type `/agent set <name> <m1> <m2> <m3> --effort <level>`).
 - `/compact [focus]`: Summarize and compact the conversation history into a concise context summary.
+- `/maxwindow [32k|64k|128k|200k|off]` (or `/autocompact`): Configure an automatic compaction threshold in tokens (persisted in `~/.local/share/cligate/prefs.json`).
 - `/resume`: Open interactive **Session Picker** to resume any saved conversation (or `/resume <id>`).
 - `/new`: Start a fresh session while keeping the previous one saved.
 - `F5` or `/status`: Display live provider health, cooldown timers, and sticky cache metrics.

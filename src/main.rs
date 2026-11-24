@@ -3814,5 +3814,12 @@ mod tests {
     fn test_tui_text_wrapping() {
         let lines = tui::wrap_text_lines("hello world\nsecond line", 10);
         assert_eq!(lines, vec!["hello", "world", "second", "line"]);
+        assert_eq!(tui::parse_token_limit("off"), Some(0));
+        assert_eq!(tui::parse_token_limit("0"), Some(0));
+        assert_eq!(tui::parse_token_limit("64k"), Some(64_000));
+        assert_eq!(tui::parse_token_limit("128K"), Some(128_000));
+        assert_eq!(tui::parse_token_limit("1m"), Some(1_000_000));
+        assert_eq!(tui::parse_token_limit("80000"), Some(80_000));
+        assert_eq!(tui::parse_token_limit("abc"), None);
     }
 }
