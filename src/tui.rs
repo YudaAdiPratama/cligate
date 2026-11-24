@@ -47,12 +47,13 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/resume", "Resume a previous session"),
     ("/new", "Start a new session"),
     ("/status", "Show provider health and cooldowns"),
+    ("/usage", "Show provider usage, limits, and progress bars"),
     ("/reset", "Clear rate-limit cooldowns"),
     ("/clear", "Clear the conversation"),
     ("/help", "Show shortcuts"),
     ("/quit", "Exit cligate"),
 ];
-const HELP_TEXT: &str = "Shortcuts\n  /model       F2 / ctrl+n   switch model and effort level\n  /effort      F3 / ctrl+t   reasoning effort\n  /setfallback [m1 m2 ...]   configure TUI-only fallback chain (or 'reset')\n  /permissions [mode]        tool permissions (ask, always-allow, read-only, reset)\n  /memory      [add|user|clear] view or update persistent TUI memory\n  /skills      [name]        browse or toggle local SKILL.md skills\n  /agent       F4 / ctrl+g   agent fallback chain\n  /compact     [focus]       compact conversation into a summary\n  /autocompact [32k|64k|off] set auto-compact token limit\n  /resume                    resume a saved session\n  /new                       start a fresh session\n  /status      F5            provider health\n  /reset       ctrl+r        clear rate-limit cooldowns\n  /clear       ctrl+l        clear conversation\n  scroll: mouse wheel, shift+up/down, PgUp/PgDn | stop: esc or ctrl+c | quit: ctrl+c x2";
+const HELP_TEXT: &str = "Shortcuts\n  /model       F2 / ctrl+n   switch model and effort level\n  /effort      F3 / ctrl+t   reasoning effort\n  /setfallback [m1 m2 ...]   configure TUI-only fallback chain (or 'reset')\n  /permissions [mode]        tool permissions (ask, always-allow, read-only, reset)\n  /memory      [add|user|clear] view or update persistent TUI memory\n  /skills      [name]        browse or toggle local SKILL.md skills\n  /agent       F4 / ctrl+g   agent fallback chain\n  /compact     [focus]       compact conversation into a summary\n  /autocompact [32k|64k|off] set auto-compact token limit\n  /resume                    resume a saved session\n  /new                       start a fresh session\n  /status      F5            provider health\n  /usage                     provider limits, tokens & progress bars\n  /reset       ctrl+r        clear rate-limit cooldowns\n  /clear       ctrl+l        clear conversation\n  scroll: mouse wheel, shift+up/down, PgUp/PgDn | stop: esc or ctrl+c | quit: ctrl+c x2";
 
 const SPLASH_MS: u64 = 2200;
 const REVEAL_MS: usize = 900;
@@ -485,6 +486,18 @@ enum PermDecision {
 }
 
 #[derive(Clone, PartialEq)]
+struct ProviderUsageRow {
+    name: String,
+    available: bool,
+    cooldown_rem: u64,
+    cooldown_total: u64,
+    calls: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_tokens: u64,
+}
+
+#[derive(Clone, PartialEq)]
 enum Modal {
     None,
     Model {
@@ -518,6 +531,9 @@ enum Modal {
     },
     Skills {
         selected: usize,
+    },
+    Usage {
+        rows: Vec<ProviderUsageRow>,
     },
     Session {
         selected: usize,
@@ -1802,6 +1818,86 @@ impl TuiState {
                     &items,
                 );
             }
+            Modal::Usage { rows: usage_rows } => {
+                let width = cols.saturating_sub(6).clamp(58, 84);
+                let mut items: Vec<(String, bool)> = Vec::new();
+                let ctx_used = estimate_history_tokens(&self.history);
+                let ctx_max = if self.auto_compact_tokens > 0 {
+                    self.auto_compact_tokens
+                } else {
+                    200_000
+                };
+                let ctx_pct = ((ctx_used.saturating_mul(100)) / ctx_max.max(1)).min(100);
+                items.push(("Context Window".to_string(), false));
+                items.push((
+                    format!(
+                        "{} {:>3}%  ~{} / {} tokens",
+                        progress_bar(ctx_pct, 20),
+                        ctx_pct,
+                        format_tokens_short(ctx_used),
+                        format_tokens_short(ctx_max),
+                    ),
+                    false,
+                ));
+                items.push((String::new(), false));
+                for r in usage_rows {
+                    let avail_pct = if r.available {
+                        100
+                    } else {
+                        let tot = r.cooldown_total.max(1);
+                        let done = tot.saturating_sub(r.cooldown_rem);
+                        ((done * 100) / tot).min(99) as usize
+                    };
+                    let state_str = if r.available {
+                        "ready".to_string()
+                    } else {
+                        format!("limited ({})", format_dur(r.cooldown_rem))
+                    };
+                    let tot_tok = r.input_tokens + r.output_tokens;
+                    items.push((
+                        format!(
+                            "{:<7} {} {:>3}%  {} · {} calls · {} tok",
+                            r.name,
+                            progress_bar(avail_pct, 16),
+                            avail_pct,
+                            state_str,
+                            r.calls,
+                            format_tokens_short(tot_tok as usize),
+                        ),
+                        false,
+                    ));
+                    if r.cached_tokens > 0 {
+                        let denom = (r.input_tokens + r.cached_tokens).max(1);
+                        let c_pct = ((r.cached_tokens * 100) / denom).min(100) as usize;
+                        items.push((
+                            format!(
+                                "        cache {} {:>3}% ({} cached)",
+                                progress_bar(c_pct, 12),
+                                c_pct,
+                                format_tokens_short(r.cached_tokens as usize),
+                            ),
+                            false,
+                        ));
+                    }
+                }
+                items.push((String::new(), false));
+                items.push((
+                    "Account quota % is not exposed by CLI tools; bars show live limits & cache."
+                        .to_string(),
+                    false,
+                ));
+                items.push(("r refresh · ← / Esc close".to_string(), false));
+                let height = (items.len() + 2).min(rows.saturating_sub(2));
+                draw_box(
+                    buf,
+                    rows,
+                    cols,
+                    width,
+                    height,
+                    "Provider Usage & Limits (/usage)",
+                    &items,
+                );
+            }
             Modal::Session { selected } => {
                 let sessions = list_saved_sessions();
                 let width = cols.saturating_sub(8).clamp(42, 82);
@@ -2325,6 +2421,11 @@ fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
                 _ => {}
             }
         }
+        Modal::Usage { .. } => match key {
+            Key::Esc | Key::Left | Key::Enter => st.modal = Modal::None,
+            Key::Char('r') | Key::Char('R') => return Action::Command("/usage".to_string()),
+            _ => {}
+        },
         Modal::Session { selected } => {
             let sessions = list_saved_sessions();
             let last = sessions.len().saturating_sub(1);
@@ -2563,6 +2664,58 @@ fn status_text(router: &ProviderRouter) -> String {
         }
     }
     out.trim_end().to_string()
+}
+
+fn progress_bar(pct: usize, width: usize) -> String {
+    let filled = (pct.min(100) * width) / 100;
+    format!(
+        "{}{}",
+        "█".repeat(filled),
+        "░".repeat(width.saturating_sub(filled))
+    )
+}
+
+fn format_dur(secs: u64) -> String {
+    if secs >= 60 {
+        format!("{}m{}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+fn collect_usage_rows(router: &Arc<ProviderRouter>, cfg: &Config) -> Vec<ProviderUsageRow> {
+    let local = router.status();
+    let remote = http_call(&cfg.host, cfg.port, "GET", "/v1/router/status", None).ok();
+    let mut rows = Vec::new();
+    for name in ["claude", "codex", "agy"] {
+        let lp = local.get("providers").and_then(|p| p.get(name));
+        let rp = remote
+            .as_ref()
+            .and_then(|r| r.get("router"))
+            .and_then(|r| r.get("providers"))
+            .and_then(|p| p.get(name));
+        let get_u64 = |src: Option<&Json>, key: &str| -> u64 {
+            src.and_then(|o| o.get(key))
+                .and_then(|v| v.as_i64())
+                .map(|v| v.max(0) as u64)
+                .unwrap_or(0)
+        };
+        let l_rem = get_u64(lp, "cooldown_remaining_sec");
+        let r_rem = get_u64(rp, "cooldown_remaining_sec");
+        let rem = l_rem.max(r_rem);
+        let tot = get_u64(lp, "cooldown_sec").max(900);
+        rows.push(ProviderUsageRow {
+            name: name.to_string(),
+            available: rem == 0,
+            cooldown_rem: rem,
+            cooldown_total: tot,
+            calls: get_u64(lp, "calls") + get_u64(rp, "calls"),
+            input_tokens: get_u64(lp, "input_tokens") + get_u64(rp, "input_tokens"),
+            output_tokens: get_u64(lp, "output_tokens") + get_u64(rp, "output_tokens"),
+            cached_tokens: get_u64(lp, "cached_tokens") + get_u64(rp, "cached_tokens"),
+        });
+    }
+    rows
 }
 
 fn check_tool_permission(state: &Arc<Mutex<TuiState>>, tool: &str, summary: &str) -> bool {
@@ -3264,6 +3417,11 @@ fn run_command(
             let _ = http_call(&cfg.host, cfg.port, "POST", "/v1/router/reset", Some(&body));
             st.refresh_badges(router);
             st.note("Rate-limit cooldowns cleared".to_string());
+        }
+        "/usage" | "/limits" | "/quota" => {
+            st.refresh_badges(router);
+            let usage_rows = collect_usage_rows(router, cfg);
+            st.modal = Modal::Usage { rows: usage_rows };
         }
         "/status" => {
             st.refresh_badges(router);

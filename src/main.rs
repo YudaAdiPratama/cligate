@@ -2028,6 +2028,9 @@ struct RouterState {
     cooldown_until: HashMap<String, f64>,
     last_error: HashMap<String, String>,
     provider_calls: HashMap<String, u64>,
+    provider_input_tokens: HashMap<String, i64>,
+    provider_output_tokens: HashMap<String, i64>,
+    provider_cached_tokens: HashMap<String, i64>,
     fallback_events: Vec<Json>,
 }
 
@@ -2043,10 +2046,16 @@ impl ProviderRouter {
         let mut cooldown_until = HashMap::new();
         let mut last_error = HashMap::new();
         let mut provider_calls = HashMap::new();
+        let mut provider_input_tokens = HashMap::new();
+        let mut provider_output_tokens = HashMap::new();
+        let mut provider_cached_tokens = HashMap::new();
         for p in ["claude", "codex", "agy"] {
             cooldown_until.insert(p.to_string(), 0.0);
             last_error.insert(p.to_string(), String::new());
             provider_calls.insert(p.to_string(), 0);
+            provider_input_tokens.insert(p.to_string(), 0);
+            provider_output_tokens.insert(p.to_string(), 0);
+            provider_cached_tokens.insert(p.to_string(), 0);
         }
         let routes = load_agent_routes(&cfg.routes_path);
         let fallback_enabled = cfg.fallback_enabled.unwrap_or_else(|| {
@@ -2066,6 +2075,9 @@ impl ProviderRouter {
                 cooldown_until,
                 last_error,
                 provider_calls,
+                provider_input_tokens,
+                provider_output_tokens,
+                provider_cached_tokens,
                 fallback_events: Vec::new(),
             }),
         }
@@ -2343,6 +2355,28 @@ impl ProviderRouter {
                 Ok((out, usage, resolved)) => {
                     let mut st = self.state.lock().unwrap();
                     *st.provider_calls.entry(provider.clone()).or_insert(0) += 1;
+                    let pt = usage
+                        .get("prompt_tokens")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    let ct = usage
+                        .get("completion_tokens")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    let ca = usage
+                        .get("prompt_tokens_details")
+                        .and_then(|d| d.get("cached_tokens"))
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    *st.provider_input_tokens
+                        .entry(provider.clone())
+                        .or_insert(0) += pt;
+                    *st.provider_output_tokens
+                        .entry(provider.clone())
+                        .or_insert(0) += ct;
+                    *st.provider_cached_tokens
+                        .entry(provider.clone())
+                        .or_insert(0) += ca;
                     if idx > 0 || provider != &primary_provider {
                         st.fallback_events.push(Json::obj(vec![
                             ("ts", Json::Num(now_sec() as f64)),
@@ -2385,7 +2419,7 @@ impl ProviderRouter {
         ))
     }
 
-    fn status(&self) -> Json {
+    pub fn status(&self) -> Json {
         let now = now_f64();
         let routes = load_agent_routes(&self.cfg.routes_path);
         let st = self.state.lock().unwrap();
@@ -2394,13 +2428,20 @@ impl ProviderRouter {
             let until = st.cooldown_until.get(p).copied().unwrap_or(0.0);
             let rem = ((until - now).max(0.0) * 10.0).round() / 10.0;
             let calls = st.provider_calls.get(p).copied().unwrap_or(0);
+            let in_tok = st.provider_input_tokens.get(p).copied().unwrap_or(0);
+            let out_tok = st.provider_output_tokens.get(p).copied().unwrap_or(0);
+            let cached_tok = st.provider_cached_tokens.get(p).copied().unwrap_or(0);
             let last_err = st.last_error.get(p).cloned().unwrap_or_default();
             provs.push((
                 p.to_string(),
                 Json::obj(vec![
                     ("available", Json::Bool(rem == 0.0)),
                     ("cooldown_remaining_sec", Json::Num(rem)),
+                    ("cooldown_sec", Json::Num(self.cfg.cooldown_sec)),
                     ("calls", Json::Num(calls as f64)),
+                    ("input_tokens", Json::Num(in_tok as f64)),
+                    ("output_tokens", Json::Num(out_tok as f64)),
+                    ("cached_tokens", Json::Num(cached_tok as f64)),
                     ("last_limit_error", Json::Str(last_err)),
                 ]),
             ));

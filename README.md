@@ -245,6 +245,7 @@ Inside the TUI:
 - `/resume`: Open interactive **Session Picker** to resume any saved conversation (or `/resume <id>`).
 - `/new`: Start a fresh session while keeping the previous one saved.
 - `F5` or `/status`: Display live provider health, cooldown timers, and sticky cache metrics.
+- `/usage`: Open interactive **Provider Usage & Limits** modal with progress bars for context window, per-provider rate-limit cooldowns, token counts, and cache savings.
 - `/reset`: Clear all 429 rate-limit cooldowns.
 - `/clear`: Clear conversation transcript.
 - `Esc` or `Ctrl+C`: Interrupt active generation; `Ctrl+C` (when idle) or `/quit` exits and prints the session ID for resuming.
