@@ -50,7 +50,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/help", "Show shortcuts"),
     ("/quit", "Exit cligate"),
 ];
-const HELP_TEXT: &str = "Shortcuts\n  /model       F2 / ctrl+n   switch model and effort level\n  /effort      F3 / ctrl+t   reasoning effort\n  /setfallback [m1 m2 ...]   configure TUI-only fallback chain (or 'reset')\n  /permissions [mode]        tool permissions (ask, always-allow, read-only, reset)\n  /agent       F4 / ctrl+g   agent fallback chain\n  /compact     [focus]       compact conversation into a summary\n  /autocompact [32k|64k|off] set auto-compact token limit\n  /resume                    resume a saved session\n  /new                       start a fresh session\n  /status      F5            provider health\n  /reset       ctrl+r        clear rate-limit cooldowns\n  /clear       ctrl+l        clear conversation\n  scroll: mouse wheel, shift+up/down, PgUp/PgDn | stop: esc or ctrl+c | quit: ctrl+c";
+const HELP_TEXT: &str = "Shortcuts\n  /model       F2 / ctrl+n   switch model and effort level\n  /effort      F3 / ctrl+t   reasoning effort\n  /setfallback [m1 m2 ...]   configure TUI-only fallback chain (or 'reset')\n  /permissions [mode]        tool permissions (ask, always-allow, read-only, reset)\n  /agent       F4 / ctrl+g   agent fallback chain\n  /compact     [focus]       compact conversation into a summary\n  /autocompact [32k|64k|off] set auto-compact token limit\n  /resume                    resume a saved session\n  /new                       start a fresh session\n  /status      F5            provider health\n  /reset       ctrl+r        clear rate-limit cooldowns\n  /clear       ctrl+l        clear conversation\n  scroll: mouse wheel, shift+up/down, PgUp/PgDn | stop: esc or ctrl+c | quit: ctrl+c x2";
 
 struct RawTermGuard {
     saved_state: Option<String>,
@@ -743,6 +743,7 @@ struct TuiState {
     cursor: usize,
     prompts: Vec<String>,
     prompt_idx: Option<usize>,
+    last_ctrl_c: Option<Instant>,
     scroll: usize,
     modal: Modal,
     sugg_sel: usize,
@@ -784,6 +785,7 @@ impl TuiState {
             cursor: 0,
             prompts: Vec::new(),
             prompt_idx: None,
+            last_ctrl_c: None,
             scroll: 0,
             modal: Modal::None,
             sugg_sel: 0,
@@ -855,6 +857,10 @@ impl TuiState {
             ("updated_at", Json::Num(now_sec() as f64)),
             ("history", Json::Arr(self.history.clone())),
             ("entries", Json::Arr(entries_json)),
+            (
+                "prompts",
+                Json::Arr(self.prompts.iter().cloned().map(Json::Str).collect()),
+            ),
         ]);
         let target = dir.join(format!("{}.json", self.session_id));
         let tmp = dir.join(format!("{}.json.tmp", self.session_id));
@@ -930,6 +936,24 @@ impl TuiState {
                     .collect()
             })
             .unwrap_or_default();
+        self.prompts = doc
+            .get("prompts")
+            .and_then(|v| v.as_arr())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if self.prompts.is_empty() {
+            self.prompts = self
+                .entries
+                .iter()
+                .filter(|e| e.kind == Kind::User)
+                .map(|e| e.text.clone())
+                .collect();
+        }
+        self.prompt_idx = None;
         self.scroll = 0;
         self.force_clear = true;
         Ok(target_id)
@@ -1237,7 +1261,7 @@ impl TuiState {
         } else if self.scroll > 0 {
             format!("scrolled up {} lines, PgDn to return", self.scroll)
         } else {
-            "/help for shortcuts, ctrl+c to quit".to_string()
+            "/help for shortcuts, ctrl+c twice to quit".to_string()
         };
         let left_room = max_w.saturating_sub(right_len + 2);
         let left = clip(&left_text, left_room);
@@ -2069,15 +2093,35 @@ fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
 
 fn handle_key(st: &mut TuiState, key: Key) -> Action {
     st.notice.clear();
+    if key != Key::CtrlC {
+        st.last_ctrl_c = None;
+    }
     let sugg_len = st.suggestions().len();
     match key {
         Key::CtrlC => {
             if st.busy {
                 request_cancel();
+                st.last_ctrl_c = None;
                 st.notice = "Stopping...".to_string();
                 return Action::None;
             }
-            return Action::Quit;
+            if !st.input.is_empty() {
+                st.input.clear();
+                st.cursor = 0;
+                st.sugg_sel = 0;
+                st.prompt_idx = None;
+                st.last_ctrl_c = None;
+                st.notice = "Input cleared".to_string();
+                return Action::None;
+            }
+            if let Some(prev) = st.last_ctrl_c {
+                if prev.elapsed() <= Duration::from_secs(2) {
+                    return Action::Quit;
+                }
+            }
+            st.last_ctrl_c = Some(Instant::now());
+            st.notice = "Press Ctrl+C again to quit".to_string();
+            return Action::None;
         }
         Key::F2 | Key::CtrlN => {
             st.modal = Modal::Model {
@@ -2151,8 +2195,6 @@ fn handle_key(st: &mut TuiState, key: Key) -> Action {
                 } else {
                     st.sugg_sel - 1
                 };
-            } else if st.input.is_empty() && st.prompt_idx.is_none() {
-                st.scroll = st.scroll.saturating_add(2);
             } else if !st.prompts.is_empty() {
                 let idx = match st.prompt_idx {
                     None => st.prompts.len() - 1,
@@ -2166,8 +2208,6 @@ fn handle_key(st: &mut TuiState, key: Key) -> Action {
         Key::Down => {
             if sugg_len > 0 {
                 st.sugg_sel = (st.sugg_sel + 1) % sugg_len;
-            } else if st.input.is_empty() && st.prompt_idx.is_none() {
-                st.scroll = st.scroll.saturating_sub(2);
             } else if let Some(i) = st.prompt_idx {
                 if i + 1 < st.prompts.len() {
                     st.prompt_idx = Some(i + 1);
