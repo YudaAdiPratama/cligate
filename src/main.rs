@@ -1818,11 +1818,33 @@ impl ProviderRouter {
         requested_model: &str,
         agent_name: Option<&str>,
     ) -> Vec<(String, String)> {
+        self.build_target_candidates_with_chain(requested_model, agent_name, None)
+    }
+
+    pub fn build_target_candidates_with_chain(
+        &self,
+        requested_model: &str,
+        agent_name: Option<&str>,
+        explicit_chain: Option<&[String]>,
+    ) -> Vec<(String, String)> {
         let (primary_provider, bare_req) =
             detect_primary_provider(requested_model, &self.cfg.default_model);
         let mut raw_targets: Vec<(String, String)> = Vec::new();
 
-        if let Some((_, chain)) = self.get_agent_config(agent_name) {
+        if let Some(chain) = explicit_chain {
+            if !chain.is_empty() {
+                let (_, first_bare) = detect_primary_provider(&chain[0], &self.cfg.default_model);
+                if !matches!(requested_model, "" | "auto" | "default") && bare_req != first_bare {
+                    raw_targets.push((primary_provider.clone(), bare_req.clone()));
+                }
+                for item in chain {
+                    let (p, b) = detect_primary_provider(item, &self.cfg.default_model);
+                    if !raw_targets.contains(&(p.clone(), b.clone())) {
+                        raw_targets.push((p, b));
+                    }
+                }
+            }
+        } else if let Some((_, chain)) = self.get_agent_config(agent_name) {
             if !chain.is_empty() {
                 let (_, first_bare) = detect_primary_provider(&chain[0], &self.cfg.default_model);
                 if !matches!(requested_model, "" | "auto" | "default") && bare_req != first_bare {
@@ -1876,8 +1898,30 @@ impl ProviderRouter {
         messages: &[Json],
         tools: Option<&[Json]>,
         requested_model: &str,
+        effort: String,
+        agent_name: Option<&str>,
+        on_delta: &mut Option<&mut dyn FnMut(&str)>,
+    ) -> Result<(String, Json, String, String), String> {
+        self.execute_turn_with_chain(
+            messages,
+            tools,
+            requested_model,
+            effort,
+            agent_name,
+            None,
+            on_delta,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_turn_with_chain(
+        &self,
+        messages: &[Json],
+        tools: Option<&[Json]>,
+        requested_model: &str,
         mut effort: String,
         agent_name: Option<&str>,
+        explicit_chain: Option<&[String]>,
         on_delta: &mut Option<&mut dyn FnMut(&str)>,
     ) -> Result<(String, Json, String, String), String> {
         if (effort.is_empty() || effort == "medium") && agent_name.is_some() {
@@ -1885,7 +1929,8 @@ impl ProviderRouter {
                 effort = ag_eff;
             }
         }
-        let candidates = self.build_target_candidates(requested_model, agent_name);
+        let candidates =
+            self.build_target_candidates_with_chain(requested_model, agent_name, explicit_chain);
         let primary_provider = candidates
             .first()
             .map(|(p, _)| p.clone())

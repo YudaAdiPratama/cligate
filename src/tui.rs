@@ -26,7 +26,7 @@ const EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const COMMANDS: &[(&str, &str)] = &[
     ("/model", "Switch model and reasoning level"),
     ("/effort", "Set reasoning effort level"),
-    ("/setfallback", "Configure fallback model chain"),
+    ("/setfallback", "Configure TUI-only fallback model chain"),
     ("/agent", "Switch agent fallback chain"),
     ("/compact", "Summarize and compact conversation history"),
     ("/resume", "Resume a previous session"),
@@ -37,7 +37,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/help", "Show shortcuts"),
     ("/quit", "Exit cligate"),
 ];
-const HELP_TEXT: &str = "Shortcuts\n  /model       F2 / ctrl+n   switch model and effort level\n  /effort      F3 / ctrl+t   reasoning effort\n  /setfallback [m1 m2 ...]   configure fallback model chain\n  /agent       F4 / ctrl+g   agent fallback chain\n  /compact     [focus]       compact conversation into a summary\n  /resume                    resume a saved session\n  /new                       start a fresh session\n  /status      F5            provider health\n  /reset       ctrl+r        clear rate-limit cooldowns\n  /clear       ctrl+l        clear conversation\n  scroll: mouse wheel, shift+up/down, PgUp/PgDn | stop: esc or ctrl+c | quit: ctrl+c";
+const HELP_TEXT: &str = "Shortcuts\n  /model       F2 / ctrl+n   switch model and effort level\n  /effort      F3 / ctrl+t   reasoning effort\n  /setfallback [m1 m2 ...]   configure TUI-only fallback chain (or 'reset')\n  /agent       F4 / ctrl+g   agent fallback chain\n  /compact     [focus]       compact conversation into a summary\n  /resume                    resume a saved session\n  /new                       start a fresh session\n  /status      F5            provider health\n  /reset       ctrl+r        clear rate-limit cooldowns\n  /clear       ctrl+l        clear conversation\n  scroll: mouse wheel, shift+up/down, PgUp/PgDn | stop: esc or ctrl+c | quit: ctrl+c";
 
 struct RawTermGuard {
     saved_state: Option<String>,
@@ -451,7 +451,6 @@ enum Modal {
         selected: usize,
         filter: String,
         chain: Vec<String>,
-        target_agent: String,
     },
     Session {
         selected: usize,
@@ -486,12 +485,12 @@ fn prefs_path() -> PathBuf {
         .unwrap_or_else(|| home_dir().join(".local/share/cligate/prefs.json"))
 }
 
-fn load_prefs() -> (Option<String>, Option<String>) {
+fn load_prefs() -> (Option<String>, Option<String>, Vec<String>) {
     let Ok(raw) = fs::read_to_string(prefs_path()) else {
-        return (None, None);
+        return (None, None, Vec::new());
     };
     let Ok(doc) = parse_json(&raw) else {
-        return (None, None);
+        return (None, None, Vec::new());
     };
     let m = doc
         .get("model")
@@ -503,17 +502,28 @@ fn load_prefs() -> (Option<String>, Option<String>) {
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
-    (m, e)
+    let fb = doc
+        .get("fallback_chain")
+        .and_then(|v| v.as_arr())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    (m, e, fb)
 }
 
-fn save_prefs(model: &str, effort: &str) {
+fn save_prefs(model: &str, effort: &str, fallback_chain: &[String]) {
     let path = prefs_path();
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
+    let fb_json: Vec<Json> = fallback_chain.iter().cloned().map(Json::Str).collect();
     let doc = Json::obj(vec![
         ("model", Json::Str(model.to_string())),
         ("effort", Json::Str(effort.to_string())),
+        ("fallback_chain", Json::Arr(fb_json)),
     ]);
     let _ = fs::write(path, format!("{}\n", doc.dump_pretty()));
 }
@@ -575,7 +585,7 @@ enum Action {
     None,
     Submit(String),
     Command(String),
-    SaveFallback { agent: String, chain: Vec<String> },
+    SaveFallback(Vec<String>),
     Quit,
 }
 
@@ -586,6 +596,7 @@ struct TuiState {
     model: String,
     effort: String,
     agent: Option<String>,
+    tui_fallback: Vec<String>,
     routes_path: String,
     cwd: String,
     history: Vec<Json>,
@@ -612,12 +623,13 @@ struct TuiState {
 
 impl TuiState {
     fn new(cfg: &Config) -> Self {
-        let (saved_model, saved_effort) = load_prefs();
+        let (saved_model, saved_effort, saved_fb) = load_prefs();
         Self {
             session_id: new_session_id(),
             model: saved_model.unwrap_or_else(|| cfg.default_model.clone()),
             effort: saved_effort.unwrap_or_else(|| "medium".to_string()),
             agent: None,
+            tui_fallback: saved_fb,
             routes_path: cfg.routes_path.clone(),
             cwd: display_cwd(),
             history: Vec::new(),
@@ -1031,8 +1043,14 @@ impl TuiState {
     fn status_line(&self, cols: usize) -> String {
         let max_w = cols.saturating_sub(1);
         let (prov, bare) = infer_provider_and_model(&self.model);
-        let agent = self.agent.as_deref().unwrap_or("no agent");
-        let mut right_plain = format!("{prov}/{bare} · {} · {agent}  ", self.effort);
+        let route_label = if let Some(a) = self.agent.as_deref() {
+            a.to_string()
+        } else if self.tui_fallback.len() > 1 {
+            format!("fb:{}", self.tui_fallback.len())
+        } else {
+            "no agent".to_string()
+        };
+        let mut right_plain = format!("{prov}/{bare} · {} · {route_label}  ", self.effort);
         let mut right_styled = format!("{GRAY}{right_plain}{RESET}");
         for (name, state) in &self.badges {
             let (mark, color) = match state {
@@ -1234,7 +1252,6 @@ impl TuiState {
                 selected,
                 filter,
                 chain,
-                target_agent,
             } => {
                 let models = self.filtered_models(filter);
                 let width = cols.saturating_sub(8).clamp(44, 80);
@@ -1260,9 +1277,9 @@ impl TuiState {
                     _ => "Pick fallback #2 (3/3, Tab=save)",
                 };
                 let title = if filter.is_empty() {
-                    format!("Fallback [{target_agent}] {step}")
+                    format!("TUI Fallback {step}")
                 } else {
-                    format!("Fallback [{target_agent}] {step}  filter: {filter}")
+                    format!("TUI Fallback {step}  filter: {filter}")
                 };
                 draw_box(buf, rows, cols, width, height, &title, &items);
             }
@@ -1420,10 +1437,10 @@ fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
                     let eff = st.effort.clone();
                     if let Some((m, prov)) = pending_model {
                         st.model = m.clone();
-                        save_prefs(&st.model, &st.effort);
+                        save_prefs(&st.model, &st.effort, &st.tui_fallback);
                         st.note(format!("Model set to {m} ({prov}, effort {eff})"));
                     } else {
-                        save_prefs(&st.model, &st.effort);
+                        save_prefs(&st.model, &st.effort, &st.tui_fallback);
                         st.note(format!("Reasoning effort set to {eff}"));
                     }
                     st.modal = Modal::None;
@@ -1469,7 +1486,6 @@ fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
             selected,
             filter,
             mut chain,
-            target_agent,
         } => {
             let models = st.filtered_models(&filter);
             let last = models.len().saturating_sub(1);
@@ -1480,7 +1496,6 @@ fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
                         selected: selected.saturating_sub(1),
                         filter,
                         chain,
-                        target_agent,
                     }
                 }
                 Key::Down | Key::ScrollDown => {
@@ -1488,7 +1503,6 @@ fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
                         selected: (selected + 1).min(last),
                         filter,
                         chain,
-                        target_agent,
                     }
                 }
                 Key::Backspace => {
@@ -1498,7 +1512,6 @@ fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
                         selected: 0,
                         filter: f,
                         chain,
-                        target_agent,
                     };
                 }
                 Key::Char(c) => {
@@ -1508,16 +1521,12 @@ fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
                         selected: 0,
                         filter: f,
                         chain,
-                        target_agent,
                     };
                 }
                 Key::Tab => {
                     st.modal = Modal::None;
                     if !chain.is_empty() {
-                        return Action::SaveFallback {
-                            agent: target_agent,
-                            chain,
-                        };
+                        return Action::SaveFallback(chain);
                     }
                 }
                 Key::Enter => {
@@ -1529,16 +1538,12 @@ fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
                     }
                     if chain.len() >= 3 {
                         st.modal = Modal::None;
-                        return Action::SaveFallback {
-                            agent: target_agent,
-                            chain,
-                        };
+                        return Action::SaveFallback(chain);
                     }
                     st.modal = Modal::Fallback {
                         selected: 0,
                         filter: String::new(),
                         chain,
-                        target_agent,
                     };
                 }
                 _ => {}
@@ -1756,7 +1761,7 @@ fn status_text(router: &ProviderRouter) -> String {
 }
 
 fn start_turn(state: &Arc<Mutex<TuiState>>, router: &Arc<ProviderRouter>, text: String) {
-    let (model, effort, agent, snapshot, idx) = {
+    let (model, effort, agent, tui_fallback, snapshot, idx) = {
         let mut st = state.lock().unwrap();
         st.history.push(Json::obj(vec![
             ("role", Json::Str("user".to_string())),
@@ -1782,10 +1787,16 @@ fn start_turn(state: &Arc<Mutex<TuiState>>, router: &Arc<ProviderRouter>, text: 
             p.clear();
         }
         st.render();
+        let fb = if st.agent.is_none() && !st.tui_fallback.is_empty() {
+            Some(st.tui_fallback.clone())
+        } else {
+            None
+        };
         (
             st.model.clone(),
             st.effort.clone(),
             st.agent.clone(),
+            fb,
             st.history.clone(),
             st.entries.len() - 1,
         )
@@ -1808,7 +1819,15 @@ fn start_turn(state: &Arc<Mutex<TuiState>>, router: &Arc<ProviderRouter>, text: 
                 }
             };
             let mut cb: Option<&mut dyn FnMut(&str)> = Some(&mut on_delta);
-            router_t.execute_turn(&snapshot, None, &model, effort, agent.as_deref(), &mut cb)
+            router_t.execute_turn_with_chain(
+                &snapshot,
+                None,
+                &model,
+                effort,
+                agent.as_deref(),
+                tui_fallback.as_deref(),
+                &mut cb,
+            )
         };
         let mut st = state_t.lock().unwrap();
         st.busy = false;
@@ -1853,7 +1872,7 @@ fn start_turn(state: &Arc<Mutex<TuiState>>, router: &Arc<ProviderRouter>, text: 
 }
 
 fn start_compact(state: &Arc<Mutex<TuiState>>, router: &Arc<ProviderRouter>, focus: String) {
-    let (model, effort, agent, snapshot, orig_count) = {
+    let (model, effort, agent, tui_fallback, snapshot, orig_count) = {
         let mut st = state.lock().unwrap();
         if st.busy {
             st.notice = "Wait for the current response before compacting".to_string();
@@ -1885,10 +1904,16 @@ fn start_compact(state: &Arc<Mutex<TuiState>>, router: &Arc<ProviderRouter>, foc
             p.clear();
         }
         st.render();
+        let fb = if st.agent.is_none() && !st.tui_fallback.is_empty() {
+            Some(st.tui_fallback.clone())
+        } else {
+            None
+        };
         (
             st.model.clone(),
             st.effort.clone(),
             st.agent.clone(),
+            fb,
             msgs,
             st.history.len(),
         )
@@ -1898,12 +1923,13 @@ fn start_compact(state: &Arc<Mutex<TuiState>>, router: &Arc<ProviderRouter>, foc
     thread::spawn(move || {
         let started = Instant::now();
         let mut no_cb: Option<&mut dyn FnMut(&str)> = None;
-        let res = router_t.execute_turn(
+        let res = router_t.execute_turn_with_chain(
             &snapshot,
             None,
             &model,
             effort,
             agent.as_deref(),
+            tui_fallback.as_deref(),
             &mut no_cb,
         );
         let mut st = state_t.lock().unwrap();
@@ -2037,6 +2063,7 @@ fn run_command(
                     }
                 }
                 let (model, eff) = (st.model.clone(), st.effort.clone());
+                save_prefs(&st.model, &st.effort, &st.tui_fallback);
                 st.note(format!("Model set to {model} (effort {eff})"));
             }
         }
@@ -2047,6 +2074,7 @@ fn run_command(
                 let lvl = parts[1].to_lowercase();
                 if EFFORT_LEVELS.contains(&lvl.as_str()) {
                     st.effort = lvl.clone();
+                    save_prefs(&st.model, &st.effort, &st.tui_fallback);
                     st.note(format!("Reasoning effort set to {lvl}"));
                 } else {
                     st.notice = "Effort must be one of low, medium, high, xhigh, max".to_string();
@@ -2055,25 +2083,19 @@ fn run_command(
         }
         "/setfallback" | "/setfalback" | "/fallback" => {
             if parts.len() == 1 {
-                let target_agent = st.agent.clone().unwrap_or_else(|| "default".to_string());
                 st.modal = Modal::Fallback {
                     selected: 0,
                     filter: String::new(),
                     chain: Vec::new(),
-                    target_agent,
                 };
+            } else if matches!(parts[1].to_lowercase().as_str(), "reset" | "clear" | "off") {
+                st.tui_fallback.clear();
+                save_prefs(&st.model, &st.effort, &st.tui_fallback);
+                st.note("TUI fallback chain cleared (API routes unchanged)".to_string());
             } else {
-                let known_agents: Vec<String> =
-                    st.agent_entries().into_iter().map(|(n, _, _)| n).collect();
-                let (target_agent, start_idx) =
-                    if parts.len() >= 3 && known_agents.iter().any(|a| a == parts[1]) {
-                        (parts[1].to_lowercase(), 2)
-                    } else {
-                        (st.agent.clone().unwrap_or_else(|| "default".to_string()), 1)
-                    };
                 let mut models = Vec::new();
                 let mut eff_ov: Option<&str> = None;
-                let mut i = start_idx;
+                let mut i = 1;
                 while i < parts.len() {
                     let is_flag = matches!(parts[i], "--effort" | "--reasoning" | "-e");
                     if is_flag && i + 1 < parts.len() {
@@ -2086,10 +2108,10 @@ fn run_command(
                 }
                 if models.is_empty() {
                     st.notice =
-                        "Usage: /setfallback [agent] <model1> <model2> [model3] [--effort <level>]"
+                        "Usage: /setfallback <model1> <model2> [model3] [--effort <level>] | reset"
                             .to_string();
                 } else {
-                    apply_fallback_chain(&mut st, router, cfg, &target_agent, &models, eff_ov);
+                    apply_tui_fallback_chain(&mut st, &models, eff_ov);
                 }
             }
         }
@@ -2117,43 +2139,23 @@ fn run_command(
     false
 }
 
-fn apply_fallback_chain(
-    st: &mut TuiState,
-    router: &Arc<ProviderRouter>,
-    cfg: &Config,
-    agent_name: &str,
-    models: &[String],
-    eff_ov: Option<&str>,
-) {
+fn apply_tui_fallback_chain(st: &mut TuiState, models: &[String], eff_ov: Option<&str>) {
     let eff_val = eff_ov.unwrap_or(&st.effort).to_lowercase();
-    match router.set_agent_chain(agent_name, models, Some(&eff_val)) {
-        Ok(_) => {
-            let chain_json: Vec<Json> = models.iter().cloned().map(Json::Str).collect();
-            let body = Json::obj(vec![
-                ("agent", Json::Str(agent_name.to_string())),
-                ("chain", Json::Arr(chain_json)),
-                ("effort", Json::Str(eff_val.clone())),
-            ]);
-            let _ = http_call(
-                &cfg.host,
-                cfg.port,
-                "POST",
-                "/v1/router/agents",
-                Some(&body),
-            );
-            st.agent = Some(agent_name.to_string());
-            if let Some(first) = models.first() {
-                st.model = first.clone();
-            }
-            st.effort = eff_val.clone();
-            save_prefs(&st.model, &st.effort);
-            st.note(format!(
-                "Fallback chain saved [{agent_name}] (effort {eff_val}): {}",
-                models.join(" -> ")
-            ));
-        }
-        Err(e) => st.notice = format!("Could not save fallback chain: {e}"),
+    if !EFFORT_LEVELS.contains(&eff_val.as_str()) {
+        st.notice = "Effort must be one of low, medium, high, xhigh, max".to_string();
+        return;
     }
+    st.agent = None;
+    st.tui_fallback = models.to_vec();
+    if let Some(first) = models.first() {
+        st.model = first.clone();
+    }
+    st.effort = eff_val.clone();
+    save_prefs(&st.model, &st.effort, &st.tui_fallback);
+    st.note(format!(
+        "TUI fallback chain saved (TUI only, effort {eff_val}): {}",
+        models.join(" -> ")
+    ));
 }
 
 fn agent_command(st: &mut TuiState, router: &Arc<ProviderRouter>, parts: &[&str]) {
@@ -2286,9 +2288,9 @@ pub fn run_tui(
             Action::None => {}
             Action::Quit => break,
             Action::Submit(text) => start_turn(&state, &router, text),
-            Action::SaveFallback { agent, chain } => {
+            Action::SaveFallback(chain) => {
                 let mut st = state.lock().unwrap();
-                apply_fallback_chain(&mut st, &router, &cfg, &agent, &chain, None);
+                apply_tui_fallback_chain(&mut st, &chain, None);
                 st.render();
             }
             Action::Command(line) => {
