@@ -1488,10 +1488,14 @@ impl TuiState {
         ));
 
         let sel = self.sugg_sel.min(suggestions.len().saturating_sub(1));
-        for (i, (cmd, desc)) in suggestions.iter().take(8).enumerate() {
-            let plain = pad_or_clip(&format!("{cmd:<10} {desc}"), cols.saturating_sub(5));
-            let row = chat_h + 5 + i;
-            if i == sel {
+        let win = sel
+            .saturating_sub(sugg_rows.saturating_sub(1))
+            .min(suggestions.len().saturating_sub(sugg_rows));
+        for (slot, (cmd, desc)) in suggestions.iter().skip(win).take(sugg_rows).enumerate() {
+            let idx = win + slot;
+            let plain = pad_or_clip(&format!("{cmd:<13} {desc}"), cols.saturating_sub(5));
+            let row = chat_h + 5 + slot;
+            if idx == sel {
                 buf.push_str(&format!(
                     "\x1b[{row};1H  {ACCENT}{BOLD}› {plain}{RESET}\x1b[K"
                 ));
