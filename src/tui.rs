@@ -56,7 +56,7 @@ impl RawTermGuard {
             .stdin(Stdio::inherit())
             .status();
         let mut out = io::stdout();
-        let _ = out.write_all(b"\x1b[?1049h\x1b[2J\x1b[H");
+        let _ = out.write_all(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[2J\x1b[H");
         let _ = out.flush();
         Self { saved_state: saved }
     }
@@ -65,7 +65,7 @@ impl RawTermGuard {
 impl Drop for RawTermGuard {
     fn drop(&mut self) {
         let mut out = io::stdout();
-        let _ = out.write_all(b"\x1b[?25h\x1b[0m\x1b[?1049l");
+        let _ = out.write_all(b"\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[0m\x1b[?1049l");
         let _ = out.flush();
         let restore = match self.saved_state {
             Some(ref st) => Command::new("stty")
@@ -140,6 +140,8 @@ enum Key {
     End,
     PageUp,
     PageDown,
+    ScrollUp,
+    ScrollDown,
     F2,
     F3,
     F4,
@@ -181,7 +183,23 @@ fn parse_escape(rx: &Receiver<u8>) -> Key {
                     return Key::Unknown;
                 };
                 if (0x40..=0x7e).contains(&b) {
+                    if matches!(b, b'M' | b'm') && params.starts_with('<') {
+                        if let Some(btn) = params[1..]
+                            .split(';')
+                            .next()
+                            .and_then(|s| s.parse::<u32>().ok())
+                        {
+                            return match btn & 0x43 {
+                                64 => Key::ScrollUp,
+                                65 => Key::ScrollDown,
+                                _ => Key::Unknown,
+                            };
+                        }
+                        return Key::Unknown;
+                    }
                     return match (b as char, params.as_str()) {
+                        ('A', p) if p.contains(';') => Key::ScrollUp,
+                        ('B', p) if p.contains(';') => Key::ScrollDown,
                         ('A', _) => Key::Up,
                         ('B', _) => Key::Down,
                         ('C', _) => Key::Right,
@@ -962,13 +980,13 @@ fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
             let last = models.len().saturating_sub(1);
             match key {
                 Key::Esc | Key::F2 => st.modal = Modal::None,
-                Key::Up => {
+                Key::Up | Key::ScrollUp => {
                     st.modal = Modal::Model {
                         selected: selected.saturating_sub(1),
                         filter,
                     }
                 }
-                Key::Down => {
+                Key::Down | Key::ScrollDown => {
                     st.modal = Modal::Model {
                         selected: (selected + 1).min(last),
                         filter,
@@ -1003,12 +1021,12 @@ fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
         }
         Modal::Effort { selected } => match key {
             Key::Esc | Key::F3 => st.modal = Modal::None,
-            Key::Up => {
+            Key::Up | Key::ScrollUp => {
                 st.modal = Modal::Effort {
                     selected: selected.saturating_sub(1),
                 }
             }
-            Key::Down => {
+            Key::Down | Key::ScrollDown => {
                 st.modal = Modal::Effort {
                     selected: (selected + 1).min(EFFORT_LEVELS.len() - 1),
                 }
@@ -1026,12 +1044,12 @@ fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
             let last = entries.len().saturating_sub(1);
             match key {
                 Key::Esc | Key::F4 => st.modal = Modal::None,
-                Key::Up => {
+                Key::Up | Key::ScrollUp => {
                     st.modal = Modal::Agent {
                         selected: selected.saturating_sub(1),
                     }
                 }
-                Key::Down => {
+                Key::Down | Key::ScrollDown => {
                     st.modal = Modal::Agent {
                         selected: (selected + 1).min(last),
                     }
@@ -1077,6 +1095,8 @@ fn handle_key(st: &mut TuiState, key: Key) -> Action {
         Key::CtrlL => return Action::Command("/clear".to_string()),
         Key::PageUp => st.scroll = st.scroll.saturating_add(8),
         Key::PageDown => st.scroll = st.scroll.saturating_sub(8),
+        Key::ScrollUp => st.scroll = st.scroll.saturating_add(3),
+        Key::ScrollDown => st.scroll = st.scroll.saturating_sub(3),
         Key::Left => st.cursor = st.cursor.saturating_sub(1),
         Key::Right => st.cursor = (st.cursor + 1).min(st.input.len()),
         Key::Home => st.cursor = 0,
