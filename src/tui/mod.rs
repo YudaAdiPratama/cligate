@@ -17,6 +17,7 @@ use crate::tools::{
     list_skills, read_memory_file, summarize_tool_call, tui_tool_definitions, PermissionMode,
 };
 use render::{clip, display_cwd};
+use std::collections::VecDeque;
 use std::fs;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
@@ -149,6 +150,7 @@ pub(super) struct TuiState {
     pub(super) cursor: usize,
     pub(super) prompts: Vec<String>,
     pub(super) prompt_idx: Option<usize>,
+    pub(super) queued_prompts: VecDeque<String>,
     pub(super) last_ctrl_c: Option<Instant>,
     pub(super) scroll: usize,
     pub(super) modal: Modal,
@@ -194,6 +196,7 @@ impl TuiState {
             cursor: 0,
             prompts: Vec::new(),
             prompt_idx: None,
+            queued_prompts: VecDeque::new(),
             last_ctrl_c: None,
             scroll: 0,
             modal: Modal::None,
@@ -994,7 +997,13 @@ fn handle_key(st: &mut TuiState, key: Key) -> Action {
             if st.busy {
                 request_cancel();
                 st.last_ctrl_c = None;
-                st.notice = "Stopping...".to_string();
+                let had_q = !st.queued_prompts.is_empty();
+                st.queued_prompts.clear();
+                st.notice = if had_q {
+                    "Stopping (queue cleared)...".to_string()
+                } else {
+                    "Stopping...".to_string()
+                };
                 return Action::None;
             }
             if !st.input.is_empty() {
@@ -1054,7 +1063,13 @@ fn handle_key(st: &mut TuiState, key: Key) -> Action {
         Key::Esc => {
             if st.busy {
                 request_cancel();
-                st.notice = "Stopping...".to_string();
+                let had_q = !st.queued_prompts.is_empty();
+                st.queued_prompts.clear();
+                st.notice = if had_q {
+                    "Stopping (queue cleared)...".to_string()
+                } else {
+                    "Stopping...".to_string()
+                };
             } else {
                 st.input.clear();
                 st.cursor = 0;
@@ -1137,13 +1152,13 @@ fn handle_key(st: &mut TuiState, key: Key) -> Action {
             if text.starts_with('/') {
                 return Action::Command(text);
             }
+            st.prompts.push(text.clone());
             if st.busy {
-                st.notice = "Still generating, wait for the current response".to_string();
-                st.input = text.chars().collect();
-                st.cursor = st.input.len();
+                st.queued_prompts.push_back(text.clone());
+                let n = st.queued_prompts.len();
+                st.note(format!("Queued (#{n}): {}", clip(&text, 72)));
                 return Action::None;
             }
-            st.prompts.push(text.clone());
             return Action::Submit(text);
         }
         Key::Unknown => {}
@@ -2032,12 +2047,25 @@ pub fn run_tui(
                         st.notice.clear();
                         st.dirty = true;
                     }
-                    let resized = st.poll_size();
-                    if st.busy || st.dirty || resized || st.splash_animating() {
-                        st.dirty = false;
-                        st.render();
+                    if !st.busy && st.modal == Modal::None {
+                        if let Some(next_prompt) = st.queued_prompts.pop_front() {
+                            Action::Submit(next_prompt)
+                        } else {
+                            let resized = st.poll_size();
+                            if st.busy || st.dirty || resized || st.splash_animating() {
+                                st.dirty = false;
+                                st.render();
+                            }
+                            continue;
+                        }
+                    } else {
+                        let resized = st.poll_size();
+                        if st.busy || st.dirty || resized || st.splash_animating() {
+                            st.dirty = false;
+                            st.render();
+                        }
+                        continue;
                     }
-                    continue;
                 }
                 Some(k) => {
                     let act = if st.modal == Modal::None {

@@ -411,6 +411,9 @@ impl TuiState {
         if self.stream_chars == 0 && !phase.is_empty() {
             info.push_str(&format!(" · {phase}"));
         }
+        if !self.queued_prompts.is_empty() {
+            info.push_str(&format!(" · {} queued", self.queued_prompts.len()));
+        }
         info.push_str(" · esc/ctrl+c to stop");
         let budget = cols.saturating_sub(label.chars().count() + 8);
         format!(
