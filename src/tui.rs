@@ -483,6 +483,7 @@ enum Modal {
     },
     MaxWindow {
         selected: usize,
+        custom: String,
     },
     Session {
         selected: usize,
@@ -1535,8 +1536,9 @@ impl TuiState {
                     &items,
                 );
             }
-            Modal::MaxWindow { selected } => {
-                let items: Vec<(String, bool)> = MAX_WINDOW_PRESETS
+            Modal::MaxWindow { selected, custom } => {
+                let custom_idx = MAX_WINDOW_PRESETS.len();
+                let mut items: Vec<(String, bool)> = MAX_WINDOW_PRESETS
                     .iter()
                     .enumerate()
                     .map(|(i, (val, label))| {
@@ -1548,15 +1550,35 @@ impl TuiState {
                         (format!("{label}{mark}"), i == *selected)
                     })
                     .collect();
-                let width = cols.saturating_sub(8).clamp(48, 76);
-                let height = items.len() + 3;
+                let is_custom_active = !MAX_WINDOW_PRESETS
+                    .iter()
+                    .any(|(v, _)| *v == self.auto_compact_tokens);
+                let input_display = if custom.is_empty() {
+                    if is_custom_active {
+                        format!(
+                            "custom  Enter value (e.g. 50k, 80000)  (active: {})",
+                            format_tokens_short(self.auto_compact_tokens)
+                        )
+                    } else {
+                        "custom  Type number (e.g. 50k, 80000)_".to_string()
+                    }
+                } else {
+                    format!("custom  {custom}_")
+                };
+                items.push((input_display, *selected == custom_idx));
+                items.push((
+                    "↑↓ choose · type digits/k/m for custom · Enter save · Esc cancel".to_string(),
+                    false,
+                ));
+                let width = cols.saturating_sub(8).clamp(54, 78);
+                let height = items.len() + 2;
                 draw_box(
                     buf,
                     rows,
                     cols,
                     width,
                     height,
-                    "Auto-Compact Limit (/autocompact <val>)",
+                    "Auto-Compact Limit (/autocompact)",
                     &items,
                 );
             }
@@ -1946,34 +1968,71 @@ fn handle_modal_key(st: &mut TuiState, key: Key) -> Action {
                 st.modal = Modal::None;
             }
         }
-        Modal::MaxWindow { selected } => {
-            let last = MAX_WINDOW_PRESETS.len().saturating_sub(1);
+        Modal::MaxWindow { selected, custom } => {
+            let custom_idx = MAX_WINDOW_PRESETS.len();
             match key {
                 Key::Esc => st.modal = Modal::None,
                 Key::Up | Key::ScrollUp => {
                     st.modal = Modal::MaxWindow {
                         selected: selected.saturating_sub(1),
+                        custom,
                     }
                 }
                 Key::Down | Key::ScrollDown => {
                     st.modal = Modal::MaxWindow {
-                        selected: (selected + 1).min(last),
+                        selected: (selected + 1).min(custom_idx),
+                        custom,
                     }
                 }
+                Key::Backspace => {
+                    let mut c = custom;
+                    c.pop();
+                    st.modal = Modal::MaxWindow {
+                        selected: custom_idx,
+                        custom: c,
+                    };
+                }
+                Key::Char(ch) if ch.is_ascii_alphanumeric() => {
+                    let mut c = custom;
+                    if c.len() < 12 {
+                        c.push(ch);
+                    }
+                    st.modal = Modal::MaxWindow {
+                        selected: custom_idx,
+                        custom: c,
+                    };
+                }
                 Key::Enter => {
-                    if let Some((val, _)) = MAX_WINDOW_PRESETS.get(selected.min(last)) {
+                    if selected == custom_idx {
+                        if let Some(limit) = parse_token_limit(&custom) {
+                            st.auto_compact_tokens = limit;
+                            write_prefs(st);
+                            if limit == 0 {
+                                st.note("Auto-compact disabled".to_string());
+                            } else {
+                                st.note(format!(
+                                    "Auto-compact limit set to {} tokens",
+                                    format_tokens_short(limit)
+                                ));
+                            }
+                            st.modal = Modal::None;
+                        } else {
+                            st.notice =
+                                "Enter a valid number (e.g. 50k, 80000, or off)".to_string();
+                        }
+                    } else if let Some((val, _)) = MAX_WINDOW_PRESETS.get(selected) {
                         st.auto_compact_tokens = *val;
                         write_prefs(st);
                         if *val == 0 {
                             st.note("Auto-compact disabled".to_string());
                         } else {
                             st.note(format!(
-                                "Auto-compact max window set to {} tokens",
+                                "Auto-compact limit set to {} tokens",
                                 format_tokens_short(*val)
                             ));
                         }
+                        st.modal = Modal::None;
                     }
-                    st.modal = Modal::None;
                 }
                 _ => {}
             }
@@ -2729,8 +2788,16 @@ fn run_command(
                 let sel = MAX_WINDOW_PRESETS
                     .iter()
                     .position(|(v, _)| *v == st.auto_compact_tokens)
-                    .unwrap_or(0);
-                st.modal = Modal::MaxWindow { selected: sel };
+                    .unwrap_or(MAX_WINDOW_PRESETS.len());
+                let custom = if sel == MAX_WINDOW_PRESETS.len() && st.auto_compact_tokens > 0 {
+                    format_tokens_short(st.auto_compact_tokens)
+                } else {
+                    String::new()
+                };
+                st.modal = Modal::MaxWindow {
+                    selected: sel,
+                    custom,
+                };
             } else if let Some(limit) = parse_token_limit(parts[1]) {
                 st.auto_compact_tokens = limit;
                 write_prefs(&st);
